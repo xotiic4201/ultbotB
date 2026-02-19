@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: xult-bot
+    runtime: python
+    region: oregon
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python xult.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: TOKEN
+        sync: false
+      - key: MAIN_SERVER_ID
+        value: 1344385779627069541
+      - key: PREMIUM_ROLE_ID
+        value: 1474136325912399994
+    disk:
+      name: data
+      mountPath: /opt/render/project/src/data
+      sizeGB: 1
+    healthCheckPath: /health
+    autoDeploy: true
