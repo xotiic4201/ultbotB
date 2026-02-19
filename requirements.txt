@@ -1,0 +1,34 @@
+# Core Dependencies
+discord.py==2.3.2
+aiohttp==3.9.1
+python-dotenv==1.0.0
+
+# Database
+sqlite3  # Built-in, no need to install
+
+# Timezone handling
+pytz==2023.3
+
+# XML parsing (for YouTube RSS)
+lxml==4.9.3
+
+# HTTP requests
+requests==2.31.0
+
+# Image handling (optional, for thumbnails)
+Pillow==10.1.0
+
+# Fuzzy matching for bad word filter
+difflib  # Built-in, no need to install
+
+# Random and time utilities
+random  # Built-in
+time    # Built-in
+datetime  # Built-in
+json    # Built-in
+re      # Built-in
+logging # Built-in
+os      # Built-in
+pathlib # Built-in
+secrets # Built-in
+asyncio # Built-in
