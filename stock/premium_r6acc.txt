@@ -1,0 +1,1 @@
+G2G Code ID,Account ID,Password,Character ID,Secret Question,Secret Answer,First Name,Last Name,Account Country,Date of Birth (eg. 01 Jan 2020),Account Email,Email Password,Additional Note 056f3372-9d9b-40a6-a8a8-5b0520972618,'hobbs271348@leenkoenraadmail.com,Gr3y45E@qb,,,,,,,,hobbs271348@leenkoenraadmail.com,6f-fAECYKL,"Email login url - notletters .com /email /login
