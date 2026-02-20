@@ -55,7 +55,7 @@ PREMIUM_ROLE_ID = int(os.getenv('PREMIUM_ROLE_ID', '1474136325912399994'))
 MAIN_SERVER_ID = int(os.getenv('MAIN_SERVER_ID', '1344385779627069541'))
 
 # API Configuration
-API_PORT = int(os.getenv('API_PORT', 5000))
+API_PORT = int(os.getenv('PORT', os.getenv('API_PORT', 10000)))
 API_KEY = os.getenv('API_KEY', secrets.token_hex(32))
 
 # Directory setup - Use current directory for Render compatibility
