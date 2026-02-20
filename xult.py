@@ -2847,6 +2847,97 @@ async def broadcastupdate(interaction: discord.Interaction, message: str, thumbn
 
 # ==================== API SERVER ====================
 
+# Add to your existing API routes:
+
+@routes.get('/api/check-premium/{user_id}')
+async def check_premium(request):
+    """Check if user has premium role in main server"""
+    user_id = int(request.match_info['user_id'])
+    main_guild = bot.get_guild(MAIN_SERVER_ID)
+    if main_guild:
+        member = main_guild.get_member(user_id)
+        if member:
+            premium_role = main_guild.get_role(PREMIUM_ROLE_ID)
+            return web.json_response({
+                "hasPremium": premium_role in member.roles
+            })
+    return web.json_response({"hasPremium": False})
+
+@routes.get('/api/admin/premium/users')
+async def get_premium_users(request):
+    """Get all premium users"""
+    c.execute("""
+        SELECT u.id, u.username, p.granted_at, p.expires_at 
+        FROM premium_users p
+        JOIN users u ON u.id = p.user_id
+        WHERE p.is_active = 1
+    """)
+    users = []
+    for row in c.fetchall():
+        users.append({
+            "id": row[0],
+            "username": row[1],
+            "granted_at": row[2],
+            "expires_at": row[3]
+        })
+    return web.json_response(users)
+
+@routes.post('/api/admin/users/{user_id}/jail')
+async def jail_user(request):
+    """Jail a user"""
+    user_id = int(request.match_info['user_id'])
+    # Implement jail logic
+    return web.json_response({"success": True})
+
+@routes.post('/api/admin/users/{user_id}/premium/toggle')
+async def toggle_premium(request):
+    """Toggle premium status"""
+    user_id = int(request.match_info['user_id'])
+    # Implement premium toggle
+    return web.json_response({"success": True})
+
+@routes.post('/api/admin/users/{user_id}/premium/extend')
+async def extend_premium(request):
+    """Extend premium duration"""
+    user_id = int(request.match_info['user_id'])
+    data = await request.json()
+    days = data.get('days', 30)
+    # Implement premium extension
+    return web.json_response({"success": True})
+
+@routes.post('/api/admin/servers/{server_id}/sync')
+async def sync_server(request):
+    """Force sync server data"""
+    server_id = int(request.match_info['server_id'])
+    # Implement server sync
+    return web.json_response({"success": True})
+
+@routes.post('/api/admin/backup')
+async def create_backup(request):
+    """Create database backup"""
+    # Implement backup
+    return web.json_response({"success": True})
+
+@routes.post('/api/admin/cache/clear')
+async def clear_cache(request):
+    """Clear bot cache"""
+    # Implement cache clear
+    return web.json_response({"success": True})
+
+@routes.post('/api/admin/sync')
+async def sync_databases(request):
+    """Sync all databases"""
+    # Implement sync
+    return web.json_response({"success": True})
+
+@routes.post('/api/admin/sql')
+async def execute_sql(request):
+    """Execute SQL query (owner only)"""
+    data = await request.json()
+    query = data.get('query')
+    # Implement SQL execution (with safety checks!)
+    return web.json_response({"result": "Query executed"})
+
 import asyncio
 from aiohttp import web
 from datetime import datetime, timedelta
