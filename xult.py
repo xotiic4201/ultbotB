@@ -23,7 +23,6 @@ from urllib.parse import quote
 import difflib
 from typing import List, Dict, Any, Optional
 import hashlib
-import psutil
 import platform
 
 # ==================== CONFIGURATION & SETUP ====================
