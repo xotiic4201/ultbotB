@@ -1,23 +1,25 @@
 services:
   - type: web
     name: xult-bot
-    runtime: python
-    region: oregon
-    plan: free
+    env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python xult.py
+    startCommand: python main.py
     envVars:
+      - key: DISCORD_BOT_TOKEN
+        sync: false
+      - key: YOUTUBE_API_KEY
+        sync: false
+      - key: TWITCH_CLIENT_ID
+        sync: false
+      - key: TWITCH_CLIENT_SECRET
+        sync: false
+      - key: TWITTER_BEARER_TOKEN
+        sync: false
+      - key: GIPHY_API_KEY
+        sync: false
+      - key: BOT_OWNER_ID
+        value: 1302203907782606880
+      - key: API_PORT
+        value: 5000
       - key: PYTHON_VERSION
         value: 3.11.0
-      - key: TOKEN
-        sync: false
-      - key: MAIN_SERVER_ID
-        value: 1344385779627069541
-      - key: PREMIUM_ROLE_ID
-        value: 1474136325912399994
-    disk:
-      name: data
-      mountPath: /opt/render/project/src/data
-      sizeGB: 1
-    healthCheckPath: /health
-    autoDeploy: true
