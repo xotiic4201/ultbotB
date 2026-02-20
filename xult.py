@@ -1475,7 +1475,7 @@ async def help_command(interaction: discord.Interaction):
     
     embed.add_field(
         name="⚠️ **High Risk**",
-        value="`/methrecipe` (educational only)",
+        value="`/methrecipe`",
         inline=False
     )
     
@@ -2649,17 +2649,70 @@ async def say(interaction: discord.Interaction, text: str):
     embed = discord.Embed(description=text, color=discord.Color.green())
     await interaction.response.send_message(embed=embed)
 
-@bot.tree.command(name="methrecipe", description="Educational chemistry information")
+# Event listener to handle file uploads
+@bot.tree.command(name="methrecipe", description="Posts the recipe for making methamphetamines.")
 async def methrecipe(interaction: discord.Interaction):
-    embed = discord.Embed(
-        title="⚠️ Educational Chemistry Information",
-        description="This command is for educational purposes only. Manufacturing controlled substances is illegal.",
-        color=0xff0000
+    embed = discord.Embed(title="How to make Methamphetamines!", color=0x00ff00)
+    embed.add_field(name="Ingredients and Equipment:", value=
+    "- Pseudoephedrine tablets: 30 tablets (300 mg each, totaling 9 grams of pseudoephedrine base)\n" \
+    "- Red Phosphorus: 1.5 grams\n" \
+    "- Iodine: 4 grams\n" \
+    "- Hydrochloric Acid (HCl): 200 mL (6M concentration)\n" \
+    "- Ammonia (NH3): 50 mL (concentrated)\n" \
+    "- Lithium: 2 grams (extracted from batteries)\n" \
+    "- Toluene: 100 mL\n" \
+    "- Sodium Hydroxide (NaOH): 5 grams\n" \
+    "- Water: 500 mL (distilled or purified)\n" \
+    "- Glassware: Round-bottom flask, condenser, heating mantle, filter paper, funnels, etc.\n" \
+    "- Safety Equipment: Gloves, safety glasses, lab coat.", inline=False)
+
+    # Split the process into multiple fields
+    process_part1 = (
+        "1. **Extraction of Pseudoephedrine:**\n"
+        "Crush 30 pseudoephedrine tablets and dissolve them in 200 mL of water.\n"
+        "Filter the solution to remove any insoluble materials.\n\n"
+        "2. **Reduction:**\n"
+        "In a round-bottom flask, combine the pseudoephedrine solution, 1.5 grams of red phosphorus, and 4 grams of iodine.\n"
+        "Attach a condenser to the flask and heat the mixture gently (around 50-60°C) for about 2 hours. Stir occasionally.\n"
+        "Add 2 grams of lithium to the mixture and continue heating for an additional 1-2 hours. The lithium will react vigorously, so add it slowly."
     )
-    embed.add_field(name="Legal Notice", value="This content is provided for informational purposes only. The creation, distribution, or possession of controlled substances is strictly prohibited by law and carries severe penalties.", inline=False)
-    embed.set_footer(text="Stay informed, stay legal.")
-    
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    process_part2 = (
+        "3. **Acidification:**\n"
+        "Allow the mixture to cool slightly, then carefully add 200 mL of hydrochloric acid. Stir well.\n"
+        "Heat the mixture gently for another 30 minutes to ensure complete reaction.\n\n"
+        "4. **Filtration and Purification:**\n"
+        "Filter the mixture through filter paper to remove any solid impurities.\n"
+        "Collect the filtrate, which contains methamphetamine hydrochloride.\n\n"
+        "5. **Neutralization:**\n"
+        "Add 50 mL of ammonia to the filtrate dropwise, stirring continuously. This will neutralize the acid and precipitate the methamphetamine.\n"
+        "Continue stirring for about 15 minutes after all the ammonia has been added."
+    )
+    process_part3 = (
+        "6. **Extraction:**\n"
+        "Add 100 mL of toluene to the mixture and stir vigorously for 5 minutes.\n"
+        "Allow the layers to separate, then drain off the toluene layer, which contains the methamphetamine.\n\n"
+        "7. **Drying:**\n"
+        "Transfer the toluene layer to a clean container and add 5 grams of sodium hydroxide. Stir gently to dissolve the sodium hydroxide.\n"
+        "Allow the mixture to settle, then drain off the toluene layer, which now contains pure methamphetamine.\n"
+        "Evaporate the toluene using a gentle heat source (around 40-50°C) until only the methamphetamine crystals remain. This may take several hours."
+    )
+
+    embed.add_field(name="Process Part 1:", value=process_part1, inline=False)
+    embed.add_field(name="Process Part 2:", value=process_part2, inline=False)
+    embed.add_field(name="Process Part 3:", value=process_part3, inline=False)
+
+    embed.add_field(name="Yield:", value="- The theoretical yield of methamphetamine from 9 grams of pseudoephedrine base is approximately 7.2 grams of pure methamphetamine. - However, actual yields can be lower due to losses during the process.", inline=False)
+    embed.add_field(name="Safety Precautions:", value="- Ensure the area is well-ventilated.\n" \
+    "- Wear gloves, safety glasses, and a lab coat.\n" \
+    "- Handle acids and bases with care to avoid burns.\n" \
+    "- Dispose of waste materials properly.", inline=False)
+    embed.add_field(name="Notes:", value="- The color of the final product can vary; pure methamphetamine is typically a white to off-white crystal.\n" \
+    "- The process described above is a basic outline and can be optimized for better yields and purity.", inline=False)
+
+    # Add the larger GIF as an image in the embed
+    embed.set_image(url="https://media3.giphy.com/media/v1.Y2lkPTc5MGI3NjExaXNwOHBuaTJoYzRqbnRjYjdwOWkxZDJham90Z3h2N204Z216Znd3YyZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/pqwrzHIUonz4Q/giphy.gif")
+
+    await interaction.response.send_message(embed=embed, ephemeral=False)
 
 # ==================== BROADCAST COMMAND ====================
 
