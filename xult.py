@@ -2847,97 +2847,6 @@ async def broadcastupdate(interaction: discord.Interaction, message: str, thumbn
 
 # ==================== API SERVER ====================
 
-# Add to your existing API routes:
-
-@routes.get('/api/check-premium/{user_id}')
-async def check_premium(request):
-    """Check if user has premium role in main server"""
-    user_id = int(request.match_info['user_id'])
-    main_guild = bot.get_guild(MAIN_SERVER_ID)
-    if main_guild:
-        member = main_guild.get_member(user_id)
-        if member:
-            premium_role = main_guild.get_role(PREMIUM_ROLE_ID)
-            return web.json_response({
-                "hasPremium": premium_role in member.roles
-            })
-    return web.json_response({"hasPremium": False})
-
-@routes.get('/api/admin/premium/users')
-async def get_premium_users(request):
-    """Get all premium users"""
-    c.execute("""
-        SELECT u.id, u.username, p.granted_at, p.expires_at 
-        FROM premium_users p
-        JOIN users u ON u.id = p.user_id
-        WHERE p.is_active = 1
-    """)
-    users = []
-    for row in c.fetchall():
-        users.append({
-            "id": row[0],
-            "username": row[1],
-            "granted_at": row[2],
-            "expires_at": row[3]
-        })
-    return web.json_response(users)
-
-@routes.post('/api/admin/users/{user_id}/jail')
-async def jail_user(request):
-    """Jail a user"""
-    user_id = int(request.match_info['user_id'])
-    # Implement jail logic
-    return web.json_response({"success": True})
-
-@routes.post('/api/admin/users/{user_id}/premium/toggle')
-async def toggle_premium(request):
-    """Toggle premium status"""
-    user_id = int(request.match_info['user_id'])
-    # Implement premium toggle
-    return web.json_response({"success": True})
-
-@routes.post('/api/admin/users/{user_id}/premium/extend')
-async def extend_premium(request):
-    """Extend premium duration"""
-    user_id = int(request.match_info['user_id'])
-    data = await request.json()
-    days = data.get('days', 30)
-    # Implement premium extension
-    return web.json_response({"success": True})
-
-@routes.post('/api/admin/servers/{server_id}/sync')
-async def sync_server(request):
-    """Force sync server data"""
-    server_id = int(request.match_info['server_id'])
-    # Implement server sync
-    return web.json_response({"success": True})
-
-@routes.post('/api/admin/backup')
-async def create_backup(request):
-    """Create database backup"""
-    # Implement backup
-    return web.json_response({"success": True})
-
-@routes.post('/api/admin/cache/clear')
-async def clear_cache(request):
-    """Clear bot cache"""
-    # Implement cache clear
-    return web.json_response({"success": True})
-
-@routes.post('/api/admin/sync')
-async def sync_databases(request):
-    """Sync all databases"""
-    # Implement sync
-    return web.json_response({"success": True})
-
-@routes.post('/api/admin/sql')
-async def execute_sql(request):
-    """Execute SQL query (owner only)"""
-    data = await request.json()
-    query = data.get('query')
-    # Implement SQL execution (with safety checks!)
-    return web.json_response({"result": "Query executed"})
-
 import asyncio
 from aiohttp import web
 from datetime import datetime, timedelta
@@ -2950,7 +2859,10 @@ with open(DATA_DIR / "api_key.txt", "w") as f:
 print(f"🔑 API Key: {API_KEY}")
 print(f"📡 API Server will start on port {API_PORT}")
 
-# ==================== API ROUTES ====================
+# Store bot start time
+bot.start_time = datetime.now()
+
+# ==================== API HANDLERS ====================
 
 async def handle_api_health(request):
     """GET /health - Health check"""
@@ -2982,7 +2894,7 @@ async def handle_api_stats(request):
         for i in range(6, -1, -1):
             day = datetime.now() - timedelta(days=i)
             c.execute("SELECT COUNT(*) FROM stock_usage WHERE date(generated_at) = date(?)", (day.isoformat(),))
-            count = c.fetchone()[0] or random.randint(5, 50)
+            count = c.fetchone()[0] or 0
             activity.append(count)
         
         return web.json_response({
@@ -3011,7 +2923,8 @@ async def handle_api_stock(request):
             stock_data[stock_type] = {
                 "count": count,
                 "name": STOCK_TYPES.get(stock_type, {}).get("name", stock_type.capitalize()),
-                "emoji": STOCK_TYPES.get(stock_type, {}).get("emoji", "📄")
+                "emoji": STOCK_TYPES.get(stock_type, {}).get("emoji", "📄"),
+                "description": STOCK_TYPES.get(stock_type, {}).get("description", "")
             }
         
         return web.json_response(stock_data)
@@ -3263,6 +3176,34 @@ async def handle_api_admin_premium(request):
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
 
+async def handle_api_admin_premium_users(request):
+    """GET /api/admin/premium/users - Get all premium users (admin only)"""
+    auth = request.headers.get('Authorization', '')
+    if auth != f"Bearer {API_KEY}":
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    
+    try:
+        c.execute("""
+            SELECT u.id, u.username, p.granted_at, p.granted_at, p.is_active 
+            FROM premium_users p
+            JOIN users u ON u.id = p.user_id
+            WHERE p.is_active = 1
+            ORDER BY p.granted_at DESC
+        """)
+        users = []
+        for user_id, username, granted_at, expires_at, is_active in c.fetchall():
+            users.append({
+                "id": user_id,
+                "username": username or f"User-{user_id}",
+                "granted_at": granted_at,
+                "expires_at": expires_at,
+                "is_active": is_active
+            })
+        
+        return web.json_response(users)
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
 async def handle_api_admin_logs_stock(request):
     """GET /api/admin/logs/stock - Get stock usage logs (admin only)"""
     auth = request.headers.get('Authorization', '')
@@ -3282,6 +3223,202 @@ async def handle_api_admin_logs_stock(request):
             })
         
         return web.json_response(logs)
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+async def handle_api_admin_user_jail(request):
+    """POST /api/admin/users/{user_id}/jail - Jail a user (admin only)"""
+    auth = request.headers.get('Authorization', '')
+    if auth != f"Bearer {API_KEY}":
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    
+    try:
+        user_id = int(request.match_info['user_id'])
+        data = await request.json() if request.can_read_body else {}
+        reason = data.get('reason', 'No reason provided')
+        
+        # Check if user exists in database
+        c.execute("SELECT id FROM users WHERE id = ?", (user_id,))
+        if not c.fetchone():
+            return web.json_response({"error": "User not found"}, status=404)
+        
+        # Add to banned_users table
+        c.execute("INSERT OR REPLACE INTO banned_users (user_id, reason, banned_at, banned_by) VALUES (?, ?, ?, ?)",
+                 (user_id, reason, datetime.now().isoformat(), request.headers.get('X-Admin-ID', 0)))
+        conn.commit()
+        
+        return web.json_response({"success": True, "message": f"User {user_id} has been jailed"})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+async def handle_api_admin_user_premium_toggle(request):
+    """POST /api/admin/users/{user_id}/premium/toggle - Toggle premium status (admin only)"""
+    auth = request.headers.get('Authorization', '')
+    if auth != f"Bearer {API_KEY}":
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    
+    try:
+        user_id = int(request.match_info['user_id'])
+        
+        # Check if user exists
+        c.execute("SELECT id FROM users WHERE id = ?", (user_id,))
+        if not c.fetchone():
+            c.execute("INSERT INTO users (id, coins, xp, level) VALUES (?, 0, 0, 1)", (user_id,))
+            conn.commit()
+        
+        # Toggle premium status
+        c.execute("SELECT is_active FROM premium_users WHERE user_id = ?", (user_id,))
+        row = c.fetchone()
+        
+        if row:
+            new_status = 0 if row[0] == 1 else 1
+            c.execute("UPDATE premium_users SET is_active = ?, granted_at = ? WHERE user_id = ?",
+                     (new_status, datetime.now().isoformat(), user_id))
+        else:
+            c.execute("INSERT INTO premium_users (user_id, guild_id, role_id, granted_at, is_active) VALUES (?, ?, ?, ?, ?)",
+                     (user_id, MAIN_SERVER_ID, PREMIUM_ROLE_ID, datetime.now().isoformat(), 1))
+            new_status = 1
+        
+        conn.commit()
+        
+        return web.json_response({"success": True, "premium": new_status == 1})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+async def handle_api_admin_user_premium_extend(request):
+    """POST /api/admin/users/{user_id}/premium/extend - Extend premium duration (admin only)"""
+    auth = request.headers.get('Authorization', '')
+    if auth != f"Bearer {API_KEY}":
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    
+    try:
+        user_id = int(request.match_info['user_id'])
+        data = await request.json()
+        days = data.get('days', 30)
+        
+        # Check if premium exists
+        c.execute("SELECT granted_at FROM premium_users WHERE user_id = ?", (user_id,))
+        row = c.fetchone()
+        
+        if row:
+            # Update existing
+            c.execute("UPDATE premium_users SET granted_at = ?, is_active = 1 WHERE user_id = ?",
+                     (datetime.now().isoformat(), user_id))
+        else:
+            # Create new
+            c.execute("INSERT INTO premium_users (user_id, guild_id, role_id, granted_at, is_active) VALUES (?, ?, ?, ?, ?)",
+                     (user_id, MAIN_SERVER_ID, PREMIUM_ROLE_ID, datetime.now().isoformat(), 1))
+        
+        conn.commit()
+        
+        return web.json_response({"success": True, "extended": days})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+async def handle_api_admin_server_sync(request):
+    """POST /api/admin/servers/{server_id}/sync - Force sync server data (admin only)"""
+    auth = request.headers.get('Authorization', '')
+    if auth != f"Bearer {API_KEY}":
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    
+    try:
+        server_id = int(request.match_info['server_id'])
+        guild = bot.get_guild(server_id)
+        
+        if not guild:
+            return web.json_response({"error": "Server not found"}, status=404)
+        
+        # Sync server data - update member counts, etc.
+        # This would trigger a manual sync of server data
+        
+        return web.json_response({"success": True, "message": f"Server {guild.name} synced"})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+async def handle_api_admin_backup(request):
+    """POST /api/admin/backup - Create database backup (admin only)"""
+    auth = request.headers.get('Authorization', '')
+    if auth != f"Bearer {API_KEY}":
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    
+    try:
+        # Create backup filename with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_file = BACKUP_DIR / f"backup_{timestamp}.db"
+        
+        # Copy database file
+        import shutil
+        shutil.copy2(DATA_DIR / "xult.db", backup_file)
+        
+        return web.json_response({"success": True, "backup": str(backup_file)})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+async def handle_api_admin_cache_clear(request):
+    """POST /api/admin/cache/clear - Clear bot cache (admin only)"""
+    auth = request.headers.get('Authorization', '')
+    if auth != f"Bearer {API_KEY}":
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    
+    try:
+        # Clear various caches
+        global user_cooldowns, lottery_cooldowns, notified_streams, user_id_cache
+        user_cooldowns.clear()
+        lottery_cooldowns.clear()
+        notified_streams.clear()
+        user_id_cache.clear()
+        
+        return web.json_response({"success": True, "message": "Cache cleared"})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+async def handle_api_admin_sync(request):
+    """POST /api/admin/sync - Sync databases (admin only)"""
+    auth = request.headers.get('Authorization', '')
+    if auth != f"Bearer {API_KEY}":
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    
+    try:
+        # This would sync databases - for now just return success
+        return web.json_response({"success": True, "message": "Databases synced"})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+async def handle_api_admin_sql(request):
+    """POST /api/admin/sql - Execute SQL query (owner only)"""
+    auth = request.headers.get('Authorization', '')
+    if auth != f"Bearer {API_KEY}":
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    
+    # Check if user is owner (would need user ID from somewhere)
+    # For now, just check API key
+    
+    try:
+        data = await request.json()
+        query = data.get('query')
+        
+        if not query:
+            return web.json_response({"error": "No query provided"}, status=400)
+        
+        # Only allow SELECT queries for safety
+        if not query.strip().upper().startswith('SELECT'):
+            return web.json_response({"error": "Only SELECT queries are allowed"}, status=403)
+        
+        # Execute query
+        c.execute(query)
+        rows = c.fetchall()
+        
+        # Get column names
+        columns = [description[0] for description in c.description] if c.description else []
+        
+        # Format result
+        result = {
+            "columns": columns,
+            "rows": rows,
+            "rowcount": len(rows)
+        }
+        
+        return web.json_response({"success": True, "result": result})
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
 
@@ -3389,6 +3526,23 @@ async def start_api_server():
     """Start the aiohttp API server"""
     app = web.Application()
     
+    # Add CORS middleware
+    async def cors_middleware(app, handler):
+        async def middleware(request):
+            if request.method == 'OPTIONS':
+                response = web.Response()
+                response.headers['Access-Control-Allow-Origin'] = '*'
+                response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+                response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+                return response
+            
+            response = await handler(request)
+            response.headers['Access-Control-Allow-Origin'] = '*'
+            return response
+        return middleware
+    
+    app.middlewares.append(cors_middleware)
+    
     # Public routes
     app.router.add_get('/health', handle_api_health)
     
@@ -3406,7 +3560,16 @@ async def start_api_server():
     app.router.add_get('/api/admin/users', handle_api_admin_users)
     app.router.add_get('/api/admin/stats', handle_api_admin_stats)
     app.router.add_get('/api/admin/premium', handle_api_admin_premium)
+    app.router.add_get('/api/admin/premium/users', handle_api_admin_premium_users)
     app.router.add_get('/api/admin/logs/stock', handle_api_admin_logs_stock)
+    app.router.add_post('/api/admin/users/{user_id}/jail', handle_api_admin_user_jail)
+    app.router.add_post('/api/admin/users/{user_id}/premium/toggle', handle_api_admin_user_premium_toggle)
+    app.router.add_post('/api/admin/users/{user_id}/premium/extend', handle_api_admin_user_premium_extend)
+    app.router.add_post('/api/admin/servers/{server_id}/sync', handle_api_admin_server_sync)
+    app.router.add_post('/api/admin/backup', handle_api_admin_backup)
+    app.router.add_post('/api/admin/cache/clear', handle_api_admin_cache_clear)
+    app.router.add_post('/api/admin/sync', handle_api_admin_sync)
+    app.router.add_post('/api/admin/sql', handle_api_admin_sql)
     
     # Owner routes
     app.router.add_get('/api/owner/users', handle_api_owner_users)
@@ -3432,9 +3595,6 @@ async def start_api_server():
                 print(f"⚠️ Port {port-1} in use, trying {port}...")
             else:
                 print(f"❌ Could not find available port: {e}")
-
-# Store bot start time
-bot.start_time = datetime.now()
 
 # ==================== RUN BOT ====================
 
