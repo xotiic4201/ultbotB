@@ -1,5 +1,5 @@
 # XULT - Ultimate Discord Bot
-# Complete merged version with advanced stock processing and vending machine API
+# Render-compatible version with stock files in root /stock directory
 
 import secrets
 import discord
@@ -57,11 +57,16 @@ MAIN_SERVER_ID = int(os.getenv('MAIN_SERVER_ID', '1344385779627069541'))
 API_PORT = int(os.getenv('API_PORT', 5000))
 API_KEY = os.getenv('API_KEY', secrets.token_hex(32))
 
-# Directory setup
-DATA_DIR = Path("data")
+# Directory setup - Use current directory for Render compatibility
+BASE_DIR = Path.cwd()
+DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
 BACKUP_DIR = DATA_DIR / "backups"
 BACKUP_DIR.mkdir(exist_ok=True)
+
+# Stock directory - in root for Render compatibility
+STOCK_DIR = BASE_DIR / "stock"
+STOCK_DIR.mkdir(exist_ok=True)
 
 # ==================== DATABASE SETUP ====================
 
@@ -325,321 +330,7 @@ notified_streams = {}
 # Twitter user cache
 user_id_cache = {}
 
-# ==================== STOCK PROCESSOR CLASS ====================
-
-class StockProcessor:
-    """Process various stock file formats"""
-    
-    @staticmethod
-    def process_mega_link(line: str) -> Optional[Dict[str, Any]]:
-        """Process MEGA.nz links"""
-        mega_pattern = r'(https?://mega\.nz/(?:folder|file)/[^\s]+)'
-        match = re.search(mega_pattern, line)
-        if match:
-            return {
-                'type': 'mega',
-                'content': match.group(1),
-                'raw': line.strip(),
-                'display': f"📁 MEGA Link: {match.group(1)}"
-            }
-        return None
-    
-    @staticmethod
-    def process_rentry_link(line: str) -> Optional[Dict[str, Any]]:
-        """Process Rentry.co links"""
-        rentry_pattern = r'(https?://rentry\.co/[^\s]+)'
-        match = re.search(rentry_pattern, line)
-        if match:
-            return {
-                'type': 'rentry',
-                'content': match.group(1),
-                'raw': line.strip(),
-                'display': f"📝 Rentry: {match.group(1)}"
-            }
-        return None
-    
-    @staticmethod
-    def process_email_pass(line: str) -> Optional[Dict[str, Any]]:
-        """Process email:password combinations"""
-        separators = [':', '|', ';']
-        
-        for separator in separators:
-            if separator in line:
-                parts = line.split(separator, 1)
-                email = parts[0].strip()
-                password = parts[1].strip()
-                
-                email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
-                if re.match(email_pattern, email) and len(password) > 3:
-                    return {
-                        'type': 'emailpass',
-                        'email': email,
-                        'password': password,
-                        'content': f"{email}:{password}",
-                        'raw': line.strip(),
-                        'display': f"📧 Email: {email}\n🔑 Password: {password}"
-                    }
-        return None
-    
-    @staticmethod
-    def process_account_line(line: str) -> Optional[Dict[str, Any]]:
-        """Process username:password format"""
-        if ':' in line and not re.search(r'https?://', line):
-            parts = line.split(':', 1)
-            username = parts[0].strip()
-            password = parts[1].strip()
-            
-            if not re.match(r'^[a-zA-Z0-9._%+-]+@', username) and len(username) > 2:
-                return {
-                    'type': 'account',
-                    'username': username,
-                    'password': password,
-                    'content': f"{username}:{password}",
-                    'raw': line.strip(),
-                    'display': f"👤 Username: {username}\n🔑 Password: {password}"
-                }
-        return None
-    
-    @staticmethod
-    def process_game_account(line: str) -> Optional[Dict[str, Any]]:
-        """Process game account formats"""
-        line_lower = line.lower()
-        
-        if 'ubisoft' in line_lower or 'uplay' in line_lower:
-            email_match = re.search(r'([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}):([^\s|]+)', line)
-            if email_match:
-                return {
-                    'type': 'ubisoft',
-                    'email': email_match.group(1),
-                    'password': email_match.group(2),
-                    'content': line.strip(),
-                    'display': f"🎮 Ubisoft Account\nEmail: {email_match.group(1)}\nPassword: {email_match.group(2)}"
-                }
-        
-        steam_match = re.search(r'Account:\s*([^:]+):([^\s]+)', line)
-        if steam_match:
-            return {
-                'type': 'steam',
-                'username': steam_match.group(1).strip(),
-                'password': steam_match.group(2).strip(),
-                'content': line.strip(),
-                'display': f"🎮 Steam Account\nUsername: {steam_match.group(1).strip()}\nPassword: {steam_match.group(2).strip()}"
-            }
-        
-        if 'epic' in line_lower:
-            epic_match = re.search(r'([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}):([^\s]+)', line)
-            if epic_match:
-                return {
-                    'type': 'epicgames',
-                    'email': epic_match.group(1),
-                    'password': epic_match.group(2),
-                    'content': line.strip(),
-                    'display': f"🎮 Epic Games Account\nEmail: {epic_match.group(1)}\nPassword: {epic_match.group(2)}"
-                }
-        
-        return None
-    
-    @staticmethod
-    def process_roblox_account(line: str) -> Optional[Dict[str, Any]]:
-        """Process Roblox account format"""
-        roblox_pattern = r'https?://(?:www\.)?roblox\.com/[^\s:]+:([^:]+):([^\s|]+)'
-        match = re.search(roblox_pattern, line)
-        if match:
-            return {
-                'type': 'roblox',
-                'username': match.group(1),
-                'password': match.group(2),
-                'content': line.strip(),
-                'display': f"🎮 Roblox Account\nUsername: {match.group(1)}\nPassword: {match.group(2)}"
-            }
-        return None
-    
-    @staticmethod
-    def process_instagram_account(line: str) -> Optional[Dict[str, Any]]:
-        """Process Instagram account format"""
-        insta_pattern = r'([a-zA-Z0-9._%+-]+(?::|:)[^\s]+)'
-        match = re.search(insta_pattern, line)
-        if match and ('instagram' in line.lower() or 'ig:' in line.lower()):
-            parts = match.group(1).split(':', 1)
-            return {
-                'type': 'instagram',
-                'username': parts[0],
-                'password': parts[1],
-                'content': line.strip(),
-                'display': f"📸 Instagram\nUsername: {parts[0]}\nPassword: {parts[1]}"
-            }
-        return None
-    
-    @staticmethod
-    def process_onlyfans_account(line: str) -> Optional[Dict[str, Any]]:
-        """Process OnlyFans account format"""
-        if 'onlyfans' in line.lower():
-            email_match = re.search(r'([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}):([^\s]+)', line)
-            if email_match:
-                return {
-                    'type': 'onlyfans',
-                    'email': email_match.group(1),
-                    'password': email_match.group(2),
-                    'content': line.strip(),
-                    'display': f"🔞 OnlyFans Account\nEmail: {email_match.group(1)}\nPassword: {email_match.group(2)}"
-                }
-        return None
-    
-    @staticmethod
-    def process_nitro_code(line: str) -> Optional[Dict[str, Any]]:
-        """Process Discord Nitro codes"""
-        nitro_pattern = r'(?:https?://)?discord\.gift/([a-zA-Z0-9]+)'
-        match = re.search(nitro_pattern, line)
-        if match:
-            return {
-                'type': 'nitro',
-                'code': match.group(1),
-                'content': f"https://discord.gift/{match.group(1)}",
-                'display': f"💎 Nitro Code: `{match.group(1)}`\nLink: https://discord.gift/{match.group(1)}"
-            }
-        return None
-    
-    @staticmethod
-    def process_spotify_account(line: str) -> Optional[Dict[str, Any]]:
-        """Process Spotify account format"""
-        if 'spotify' in line.lower():
-            email_match = re.search(r'([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}):([^\s]+)', line)
-            if email_match:
-                return {
-                    'type': 'spotify',
-                    'email': email_match.group(1),
-                    'password': email_match.group(2),
-                    'content': line.strip(),
-                    'display': f"🎵 Spotify Account\nEmail: {email_match.group(1)}\nPassword: {email_match.group(2)}"
-                }
-        return None
-    
-    @staticmethod
-    def process_netflix_account(line: str) -> Optional[Dict[str, Any]]:
-        """Process Netflix account format"""
-        if 'netflix' in line.lower():
-            email_match = re.search(r'([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}):([^\s]+)', line)
-            if email_match:
-                return {
-                    'type': 'netflix',
-                    'email': email_match.group(1),
-                    'password': email_match.group(2),
-                    'content': line.strip(),
-                    'display': f"🎬 Netflix Account\nEmail: {email_match.group(1)}\nPassword: {email_match.group(2)}"
-                }
-        return None
-    
-    @staticmethod
-    def process_line(line: str) -> List[Dict[str, Any]]:
-        """Process a single line and return all found entries"""
-        entries = []
-        
-        line = line.strip()
-        if not line or line.startswith('#'):
-            return entries
-        
-        processors = [
-            StockProcessor.process_mega_link,
-            StockProcessor.process_rentry_link,
-            StockProcessor.process_nitro_code,
-            StockProcessor.process_roblox_account,
-            StockProcessor.process_game_account,
-            StockProcessor.process_instagram_account,
-            StockProcessor.process_onlyfans_account,
-            StockProcessor.process_spotify_account,
-            StockProcessor.process_netflix_account,
-            StockProcessor.process_email_pass,
-            StockProcessor.process_account_line
-        ]
-        
-        for processor in processors:
-            result = processor(line)
-            if result:
-                entries.append(result)
-        
-        if not entries and line:
-            entries.append({
-                'type': 'generic',
-                'content': line,
-                'raw': line,
-                'display': line
-            })
-        
-        return entries
-    
-    @staticmethod
-    def parse_file_content(content: str, filename: str = None) -> List[Dict[str, Any]]:
-        """Parse entire file content and categorize entries"""
-        all_entries = []
-        lines = content.split('\n')
-        
-        for line in lines:
-            entries = StockProcessor.process_line(line)
-            for entry in entries:
-                if filename:
-                    entry['source'] = filename
-                all_entries.append(entry)
-        
-        return all_entries
-    
-    @staticmethod
-    def determine_stock_type(content: str, filename: str = None) -> str:
-        """Determine the best stock type based on content"""
-        content_lower = content.lower()
-        
-        if filename:
-            filename_lower = filename.lower()
-            if 'onlyfans' in filename_lower:
-                return 'onlyfans'
-            elif 'instagram' in filename_lower:
-                return 'instagram'
-            elif 'roblox' in filename_lower:
-                return 'roblox'
-            elif 'steam' in filename_lower:
-                return 'steam'
-            elif 'epic' in filename_lower:
-                return 'epicgames'
-            elif 'ubisoft' in filename_lower:
-                return 'ubisoft'
-            elif 'nitro' in filename_lower or 'discord' in filename_lower:
-                return 'discord_nitro'
-            elif 'spotify' in filename_lower:
-                return 'spotify'
-            elif 'netflix' in filename_lower:
-                return 'netflix'
-        
-        if re.search(r'mega\.nz', content_lower):
-            return 'mega_links'
-        elif re.search(r'rentry\.co', content_lower):
-            return 'rentry_links'
-        elif re.search(r'discord\.gift', content_lower):
-            return 'discord_nitro'
-        elif re.search(r'roblox\.com', content_lower):
-            return 'roblox'
-        elif re.search(r'instagram', content_lower):
-            return 'instagram'
-        elif re.search(r'onlyfans', content_lower):
-            return 'onlyfans'
-        elif re.search(r'spotify', content_lower):
-            return 'spotify'
-        elif re.search(r'netflix', content_lower):
-            return 'netflix'
-        elif re.search(r'steam', content_lower):
-            return 'steam'
-        elif re.search(r'ubisoft|uplay', content_lower):
-            return 'ubisoft'
-        elif re.search(r'epicgames|epic games', content_lower):
-            return 'epicgames'
-        elif re.search(r'@gmail|@yahoo|@hotmail', content_lower):
-            return 'email_accounts'
-        else:
-            return 'accounts'
-
-
-# ==================== STOCK/GEN HELPER FUNCTIONS ====================
-
-STOCK_DIR = DATA_DIR / "stock"
-STOCK_DIR.mkdir(exist_ok=True)
+# ==================== STOCK HELPER FUNCTIONS ====================
 
 def get_stock_filename(stock_type: str):
     """Get filename for stock type"""
@@ -659,14 +350,6 @@ def count_stock(stock_type: str) -> int:
         content = filename.read_text(encoding="utf-8").strip()
         if not content:
             return 0
-        
-        if content.startswith('[') and content.endswith(']'):
-            try:
-                entries = json.loads(content)
-                return len(entries) if isinstance(entries, list) else 0
-            except:
-                pass
-        
         return len([l for l in content.split('\n') if l.strip()])
     except:
         return 0
@@ -679,40 +362,18 @@ def read_stock_entries(stock_type: str) -> list:
         content = filename.read_text(encoding="utf-8").strip()
         if not content:
             return []
-        
-        if content.startswith('[') and content.endswith(']'):
-            try:
-                entries = json.loads(content)
-                return entries if isinstance(entries, list) else []
-            except:
-                pass
-        
         return [line.strip() for line in content.split('\n') if line.strip()]
     except:
         return []
 
 def write_stock_entries(stock_type: str, entries: list):
     filename = get_stock_filename(stock_type)
-    
-    if entries and isinstance(entries[0], dict):
-        with open(filename, "w", encoding="utf-8") as f:
-            json.dump(entries, f, indent=2)
-    else:
-        with open(filename, "w", encoding="utf-8") as f:
-            f.write('\n'.join(str(e) for e in entries))
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write('\n'.join(str(e) for e in entries))
 
 def add_stock_entries(stock_type: str, new_entries: list):
     current = read_stock_entries(stock_type)
-    
-    if current and isinstance(current[0], dict) and new_entries and isinstance(new_entries[0], dict):
-        current.extend(new_entries)
-    elif current and isinstance(current[0], str) and new_entries and isinstance(new_entries[0], str):
-        current.extend(new_entries)
-    else:
-        current = [str(e) for e in current]
-        new_entries_str = [str(e) for e in new_entries]
-        current.extend(new_entries_str)
-    
+    current.extend(new_entries)
     write_stock_entries(stock_type, current)
 
 def get_stock_entry(stock_type: str) -> Optional[str]:
@@ -724,10 +385,7 @@ def get_stock_entry(stock_type: str) -> Optional[str]:
     first = entries[0]
     remaining = entries[1:]
     write_stock_entries(stock_type, remaining)
-    
-    if isinstance(first, dict):
-        return first.get('display', first.get('content', str(first)))
-    return str(first)
+    return first
 
 def is_on_cooldown(user_id: int) -> tuple:
     timeout = CUSTOM_USER_TIMEOUT if user_id == CUSTOM_USER_ID else FREE_GEN_TIMEOUT
@@ -740,125 +398,23 @@ def is_on_cooldown(user_id: int) -> tuple:
 def set_cooldown(user_id: int):
     user_cooldowns[user_id] = time.time()
 
-# ==================== CANDY METADATA ====================
+# ==================== STOCK TYPE DEFINITIONS ====================
 
-CANDY_DEFAULTS = {
-    "nitro": {
-        "name": "Nitro Blast",
-        "flavor": "Blue Raspberry",
-        "emoji": "💎",
-        "color": "from-purple-500 to-pink-500",
-        "cooldown": 5
-    },
-    "spotify": {
-        "name": "Spotify Sours",
-        "flavor": "Green Apple",
-        "emoji": "🎵",
-        "color": "from-green-500 to-emerald-500",
-        "cooldown": 5
-    },
-    "netflix": {
-        "name": "Netflix Nibs",
-        "flavor": "Cherry",
-        "emoji": "🎬",
-        "color": "from-red-500 to-rose-500",
-        "cooldown": 5
-    },
-    "steam": {
-        "name": "Steam Drops",
-        "flavor": "Cola",
-        "emoji": "🎮",
-        "color": "from-gray-700 to-gray-900",
-        "cooldown": 5
-    },
-    "discord_nitro": {
-        "name": "Discord Dots",
-        "flavor": "Blueberry",
-        "emoji": "💬",
-        "color": "from-indigo-500 to-purple-500",
-        "cooldown": 5
-    },
-    "minecraft": {
-        "name": "Minecraft Blocks",
-        "flavor": "Melon",
-        "emoji": "⛏️",
-        "color": "from-green-700 to-lime-600",
-        "cooldown": 5
-    },
-    "roblox": {
-        "name": "Roblox Rocks",
-        "flavor": "Mixed Berry",
-        "emoji": "🎮",
-        "color": "from-red-500 to-orange-500",
-        "cooldown": 5
-    },
-    "epicgames": {
-        "name": "Epic Energy",
-        "flavor": "Tropical",
-        "emoji": "⚡",
-        "color": "from-purple-500 to-blue-500",
-        "cooldown": 5
-    },
-    "ubisoft": {
-        "name": "Ubisoft Bites",
-        "flavor": "Grape",
-        "emoji": "🎯",
-        "color": "from-blue-500 to-indigo-500",
-        "cooldown": 5
-    },
-    "instagram": {
-        "name": "Insta Drops",
-        "flavor": "Pink Lemonade",
-        "emoji": "📸",
-        "color": "from-pink-500 to-orange-500",
-        "cooldown": 5
-    },
-    "onlyfans": {
-        "name": "Only Candies",
-        "flavor": "Passion Fruit",
-        "emoji": "🔞",
-        "color": "from-red-500 to-pink-500",
-        "cooldown": 5
-    },
-    "mega_links": {
-        "name": "Mega Mix",
-        "flavor": "Mixed",
-        "emoji": "📁",
-        "color": "from-blue-500 to-cyan-500",
-        "cooldown": 5
-    },
-    "rentry_links": {
-        "name": "Rentry Drops",
-        "flavor": "Mixed",
-        "emoji": "📝",
-        "color": "from-gray-500 to-gray-700",
-        "cooldown": 5
-    },
-    "email_accounts": {
-        "name": "Email Treats",
-        "flavor": "Mixed",
-        "emoji": "📧",
-        "color": "from-yellow-500 to-orange-500",
-        "cooldown": 5
-    },
-    "accounts": {
-        "name": "Account Mix",
-        "flavor": "Mixed",
-        "emoji": "👤",
-        "color": "from-purple-500 to-pink-500",
-        "cooldown": 5
-    }
+STOCK_TYPES = {
+    "steam": {"name": "Steam Accounts", "emoji": "🎮", "description": "Steam game accounts"},
+    "netflix": {"name": "Netflix Accounts", "emoji": "🎬", "description": "Netflix premium accounts"},
+    "spotify": {"name": "Spotify Accounts", "emoji": "🎵", "description": "Spotify premium accounts"},
+    "discord": {"name": "Discord Nitro", "emoji": "💎", "description": "Discord Nitro codes"},
+    "minecraft": {"name": "Minecraft Accounts", "emoji": "⛏️", "description": "Minecraft Java accounts"},
+    "roblox": {"name": "Roblox Accounts", "emoji": "🎮", "description": "Roblox game accounts"},
+    "epicgames": {"name": "Epic Games", "emoji": "⚡", "description": "Epic Games accounts"},
+    "ubisoft": {"name": "Ubisoft", "emoji": "🎯", "description": "Ubisoft/Uplay accounts"},
+    "instagram": {"name": "Instagram", "emoji": "📸", "description": "Instagram accounts"},
+    "onlyfans": {"name": "OnlyFans", "emoji": "🔞", "description": "OnlyFans premium accounts"},
+    "mega": {"name": "MEGA Links", "emoji": "📁", "description": "MEGA.nz file links"},
+    "email": {"name": "Email Accounts", "emoji": "📧", "description": "Email:password combinations"},
+    "accounts": {"name": "General Accounts", "emoji": "👤", "description": "Various account types"}
 }
-
-def get_candy_metadata(stock_type: str) -> dict:
-    """Get candy metadata for a stock type"""
-    return CANDY_DEFAULTS.get(stock_type, {
-        "name": stock_type.replace('_', ' ').title(),
-        "flavor": "Mixed",
-        "emoji": "🍬",
-        "color": "from-purple-500 to-pink-500",
-        "cooldown": 5
-    })
 
 # ==================== MODERATION HELPER FUNCTIONS ====================
 
@@ -1102,12 +658,64 @@ async def send_four_twenty_message(guild, channel_id, role_id, voice_channel_id)
     except:
         pass
 
+# ==================== ECONOMY FUNCTIONS ====================
+
+def get_balance(user_id: int) -> int:
+    c.execute("SELECT coins FROM users WHERE id = ?", (user_id,))
+    row = c.fetchone()
+    if row:
+        return row[0]
+    c.execute("INSERT INTO users (id, coins, xp, level) VALUES (?, 0, 0, 1)", (user_id,))
+    conn.commit()
+    return 0
+
+def add_coins(user_id: int, amount: int):
+    current = get_balance(user_id)
+    c.execute("UPDATE users SET coins = ? WHERE id = ?", (current + amount, user_id))
+    conn.commit()
+
+def remove_coins(user_id: int, amount: int):
+    current = get_balance(user_id)
+    new_balance = max(0, current - amount)
+    c.execute("UPDATE users SET coins = ? WHERE id = ?", (new_balance, user_id))
+    conn.commit()
+
+def get_xp(user_id: int) -> int:
+    c.execute("SELECT xp FROM users WHERE id = ?", (user_id,))
+    row = c.fetchone()
+    return row[0] if row else 0
+
+def get_level(user_id: int) -> int:
+    c.execute("SELECT level FROM users WHERE id = ?", (user_id,))
+    row = c.fetchone()
+    return row[0] if row else 1
+
+def add_xp(user_id: int, amount: int) -> bool:
+    current_xp = get_xp(user_id)
+    current_level = get_level(user_id)
+    new_xp = current_xp + amount
+    c.execute("UPDATE users SET xp = ? WHERE id = ?", (new_xp, user_id))
+    conn.commit()
+    
+    # Check if leveled up
+    new_level = int(new_xp ** 0.5)  # XP needed = level^2
+    if new_level > current_level:
+        c.execute("UPDATE users SET level = ? WHERE id = ?", (new_level, user_id))
+        conn.commit()
+        return True
+    return False
+
 # ==================== EVENTS ====================
 
 @bot.event
 async def on_ready():
     print(f'✅ Logged in as {bot.user}')
     print(f'Bot ID: {bot.user.id}')
+    print(f'Stock directory: {STOCK_DIR}')
+    
+    # Create default stock files
+    for stock_type in STOCK_TYPES.keys():
+        create_stock_file(stock_type)
     
     # Sync commands
     try:
@@ -1129,7 +737,6 @@ async def on_ready():
     bot.loop.create_task(start_api_server())
     
     print("✅ All background tasks started")
-    print("✅ API server task created")
 
 @bot.event
 async def on_message(message):
@@ -1960,12 +1567,6 @@ async def help_command(interaction: discord.Interaction):
     )
     
     embed.add_field(
-        name="🍬 **Candy Vending**",
-        value="`/candy` `/candylist`",
-        inline=False
-    )
-    
-    embed.add_field(
         name="⚙️ **Server Management**",
         value="`/reactionrole` `/setupverification` `/setverifybutton` `/setreportchannel` `/report` `/setlogchannels` `/updatelogchannels` `/save_server` `/load_server`",
         inline=False
@@ -1984,12 +1585,6 @@ async def help_command(interaction: discord.Interaction):
     )
     
     embed.add_field(
-        name="⚠️ **High Risk**",
-        value="`/methrecipe`",
-        inline=False
-    )
-    
-    embed.add_field(
         name="📢 **Broadcast**",
         value="`/broadcastupdate` (Bot Owner only)",
         inline=False
@@ -1999,70 +1594,32 @@ async def help_command(interaction: discord.Interaction):
     
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-@bot.tree.command(name="candy", description="🍬 Access the candy vending machine")
-async def candy(interaction: discord.Interaction):
-    """Open the candy vending machine (premium only)"""
+@bot.tree.command(name="stocklist", description="List all available stock types")
+async def stocklist(interaction: discord.Interaction):
+    """List all available stock types with counts"""
     
-    # Check if user has premium role
-    has_premium = False
-    if interaction.guild and interaction.guild.id == MAIN_SERVER_ID:
-        premium_role = interaction.guild.get_role(PREMIUM_ROLE_ID)
-        if premium_role and premium_role in interaction.user.roles:
-            has_premium = True
+    embed = discord.Embed(
+        title="📦 Available Stock",
+        description="Use `/gen <type>` to generate from any available stock.",
+        color=discord.Color.blue()
+    )
     
-    if not has_premium:
-        embed = discord.Embed(
-            title="🍬 Premium Required",
-            description="You need the **Premium** role to access the candy vending machine.",
-            color=discord.Color.red()
-        )
-        embed.add_field(name="Role ID", value=f"`{PREMIUM_ROLE_ID}`", inline=False)
-        embed.add_field(name="Server", value=f"Join the main server to get premium!", inline=False)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-        return
-    
-    # Get stock info
-    stock_info = []
+    stock_count = 0
     for file in STOCK_DIR.glob("*.txt"):
         stock_type = file.stem
         count = count_stock(stock_type)
-        meta = get_candy_metadata(stock_type)
-        stock_info.append(f"{meta['emoji']} **{meta['name']}**: {count} left")
-    
-    embed = discord.Embed(
-        title="🍬 Candy Vending Machine",
-        description="Welcome to the candy vending machine! Use `/gen <type>` to dispense candy.",
-        color=discord.Color.pink()
-    )
-    embed.add_field(name="Available Candy", value="\n".join(stock_info) if stock_info else "No candy available", inline=False)
-    embed.add_field(name="Cooldown", value="5 seconds per generation", inline=True)
-    embed.add_field(name="Premium Role", value=f"<@&{PREMIUM_ROLE_ID}>", inline=True)
-    
-    await interaction.response.send_message(embed=embed)
-
-@bot.tree.command(name="candylist", description="🍬 List all available candy types")
-async def candylist(interaction: discord.Interaction):
-    """List all available candy types with counts"""
-    
-    embed = discord.Embed(
-        title="🍬 Candy Menu",
-        color=discord.Color.pink()
-    )
-    
-    for file in STOCK_DIR.glob("*.txt"):
-        stock_type = file.stem
-        count = count_stock(stock_type)
-        meta = get_candy_metadata(stock_type)
-        
-        status = "🟢" if count > 10 else "🟡" if count > 0 else "🔴"
+        stock_info = STOCK_TYPES.get(stock_type, {"name": stock_type.capitalize(), "emoji": "📄"})
         embed.add_field(
-            name=f"{meta['emoji']} {meta['name']}",
-            value=f"{status} {count} left\n*{meta['flavor']}*",
+            name=f"{stock_info['emoji']} {stock_info['name']}",
+            value=f"`{count}` available\n*{stock_info.get('description', '')}*",
             inline=True
         )
+        stock_count += count
     
     if not embed.fields:
-        embed.description = "No candy available!"
+        embed.description = "No stock available!"
+    
+    embed.set_footer(text=f"Total entries: {stock_count} • Cooldown: 5 seconds")
     
     await interaction.response.send_message(embed=embed)
 
@@ -2712,14 +2269,13 @@ async def addstock(interaction: discord.Interaction, stock_type: str, file: disc
         return
     
     if file and file.filename.endswith(".txt"):
-        # Parse the uploaded file
         content = await file.read()
         decoded = content.decode("utf-8", errors="ignore")
-        entries = StockProcessor.parse_file_content(decoded, filename=file.filename)
+        lines = [line.strip() for line in decoded.split('\n') if line.strip()]
         
-        if entries:
-            add_stock_entries(stock_type, entries)
-            await interaction.response.send_message(f"✅ Added {len(entries)} entries to **{stock_type}** stock!", ephemeral=True)
+        if lines:
+            add_stock_entries(stock_type, lines)
+            await interaction.response.send_message(f"✅ Added {len(lines)} entries to **{stock_type}** stock!", ephemeral=True)
             await send_auto_update()
         else:
             await interaction.response.send_message("⚠️ No valid entries found in the file.", ephemeral=True)
@@ -2865,30 +2421,6 @@ async def setautoupdate(interaction: discord.Interaction, channel: discord.TextC
     
     await interaction.response.send_message(f"✅ Auto-update set to {channel.mention} with role {role.mention}.", ephemeral=False)
 
-@bot.tree.command(name="stocklist", description="List all available stock types")
-async def stocklist(interaction: discord.Interaction):
-    """List all available stock types with counts"""
-    
-    embed = discord.Embed(
-        title="📦 Stock List",
-        color=discord.Color.blue()
-    )
-    
-    for file in STOCK_DIR.glob("*.txt"):
-        stock_type = file.stem
-        count = count_stock(stock_type)
-        meta = get_candy_metadata(stock_type)
-        embed.add_field(
-            name=f"{meta['emoji']} {meta['name']}",
-            value=f"`{count}` left\n*{meta['flavor']}*",
-            inline=True
-        )
-    
-    if not embed.fields:
-        embed.description = "No stock available!"
-    
-    await interaction.response.send_message(embed=embed)
-
 # ==================== SERVER MANAGEMENT COMMANDS ====================
 
 @bot.tree.command(name="reactionrole", description="Create a reaction role dropdown menu")
@@ -2937,7 +2469,7 @@ async def setupverification(interaction: discord.Interaction, verify_channel: di
         'verify_log_channel': str(log_channel.id)
     }
     
-    with open("settings.json", "w") as f:
+    with open(DATA_DIR / "settings.json", "w") as f:
         json.dump(settings, f)
     
     await interaction.response.send_message(
@@ -2950,11 +2482,12 @@ async def setupverification(interaction: discord.Interaction, verify_channel: di
 
 @bot.tree.command(name="setverifybutton", description="Send verification button to the verification channel")
 async def setverifybutton(interaction: discord.Interaction):
-    if not os.path.exists("settings.json"):
+    settings_file = DATA_DIR / "settings.json"
+    if not settings_file.exists():
         await interaction.response.send_message("❌ Please run `/setupverification` first.", ephemeral=True)
         return
     
-    with open("settings.json", "r") as f:
+    with open(settings_file, "r") as f:
         settings = json.load(f)
     
     verify_channel_id = settings.get('verify_channel')
@@ -3218,8 +2751,6 @@ async def test(interaction: discord.Interaction):
 
 @bot.tree.command(name="gif", description="Get a GIF from GIPHY")
 async def gif(interaction: discord.Interaction, search: str):
-    GIPHY_API_KEY = ("dimlVnesALO2DLu14diWdZAAcZIgW1L1")
-
     async with aiohttp.ClientSession() as session:
         url = (
             f"https://api.giphy.com/v1/gifs/search"
@@ -3273,71 +2804,6 @@ async def say(interaction: discord.Interaction, text: str):
     embed = discord.Embed(description=text, color=discord.Color.green())
     await interaction.response.send_message(embed=embed)
 
-# Event listener to handle file uploads
-@bot.tree.command(name="methrecipe", description="Posts the recipe for making methamphetamines.")
-async def methrecipe(interaction: discord.Interaction):
-    embed = discord.Embed(title="How to make Methamphetamines!", color=0x00ff00)
-    embed.add_field(name="Ingredients and Equipment:", value=
-    "- Pseudoephedrine tablets: 30 tablets (300 mg each, totaling 9 grams of pseudoephedrine base)\n" \
-    "- Red Phosphorus: 1.5 grams\n" \
-    "- Iodine: 4 grams\n" \
-    "- Hydrochloric Acid (HCl): 200 mL (6M concentration)\n" \
-    "- Ammonia (NH3): 50 mL (concentrated)\n" \
-    "- Lithium: 2 grams (extracted from batteries)\n" \
-    "- Toluene: 100 mL\n" \
-    "- Sodium Hydroxide (NaOH): 5 grams\n" \
-    "- Water: 500 mL (distilled or purified)\n" \
-    "- Glassware: Round-bottom flask, condenser, heating mantle, filter paper, funnels, etc.\n" \
-    "- Safety Equipment: Gloves, safety glasses, lab coat.", inline=False)
-
-    # Split the process into multiple fields
-    process_part1 = (
-        "1. **Extraction of Pseudoephedrine:**\n"
-        "Crush 30 pseudoephedrine tablets and dissolve them in 200 mL of water.\n"
-        "Filter the solution to remove any insoluble materials.\n\n"
-        "2. **Reduction:**\n"
-        "In a round-bottom flask, combine the pseudoephedrine solution, 1.5 grams of red phosphorus, and 4 grams of iodine.\n"
-        "Attach a condenser to the flask and heat the mixture gently (around 50-60°C) for about 2 hours. Stir occasionally.\n"
-        "Add 2 grams of lithium to the mixture and continue heating for an additional 1-2 hours. The lithium will react vigorously, so add it slowly."
-    )
-    process_part2 = (
-        "3. **Acidification:**\n"
-        "Allow the mixture to cool slightly, then carefully add 200 mL of hydrochloric acid. Stir well.\n"
-        "Heat the mixture gently for another 30 minutes to ensure complete reaction.\n\n"
-        "4. **Filtration and Purification:**\n"
-        "Filter the mixture through filter paper to remove any solid impurities.\n"
-        "Collect the filtrate, which contains methamphetamine hydrochloride.\n\n"
-        "5. **Neutralization:**\n"
-        "Add 50 mL of ammonia to the filtrate dropwise, stirring continuously. This will neutralize the acid and precipitate the methamphetamine.\n"
-        "Continue stirring for about 15 minutes after all the ammonia has been added."
-    )
-    process_part3 = (
-        "6. **Extraction:**\n"
-        "Add 100 mL of toluene to the mixture and stir vigorously for 5 minutes.\n"
-        "Allow the layers to separate, then drain off the toluene layer, which contains the methamphetamine.\n\n"
-        "7. **Drying:**\n"
-        "Transfer the toluene layer to a clean container and add 5 grams of sodium hydroxide. Stir gently to dissolve the sodium hydroxide.\n"
-        "Allow the mixture to settle, then drain off the toluene layer, which now contains pure methamphetamine.\n"
-        "Evaporate the toluene using a gentle heat source (around 40-50°C) until only the methamphetamine crystals remain. This may take several hours."
-    )
-
-    embed.add_field(name="Process Part 1:", value=process_part1, inline=False)
-    embed.add_field(name="Process Part 2:", value=process_part2, inline=False)
-    embed.add_field(name="Process Part 3:", value=process_part3, inline=False)
-
-    embed.add_field(name="Yield:", value="- The theoretical yield of methamphetamine from 9 grams of pseudoephedrine base is approximately 7.2 grams of pure methamphetamine. - However, actual yields can be lower due to losses during the process.", inline=False)
-    embed.add_field(name="Safety Precautions:", value="- Ensure the area is well-ventilated.\n" \
-    "- Wear gloves, safety glasses, and a lab coat.\n" \
-    "- Handle acids and bases with care to avoid burns.\n" \
-    "- Dispose of waste materials properly.", inline=False)
-    embed.add_field(name="Notes:", value="- The color of the final product can vary; pure methamphetamine is typically a white to off-white crystal.\n" \
-    "- The process described above is a basic outline and can be optimized for better yields and purity.", inline=False)
-
-    # Add the larger GIF as an image in the embed
-    embed.set_image(url="https://media3.giphy.com/media/v1.Y2lkPTc5MGI3NjExaXNwOHBuaTJoYzRqbnRjYjdwOWkxZDJham90Z3h2N204Z216Znd3YyZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/pqwrzHIUonz4Q/giphy.gif")
-
-    await interaction.response.send_message(embed=embed, ephemeral=False)
-
 # ==================== BROADCAST COMMAND ====================
 
 @bot.tree.command(name="broadcastupdate", description="Broadcast an update to all servers (Bot Owner only)")
@@ -3383,10 +2849,7 @@ async def broadcastupdate(interaction: discord.Interaction, message: str, thumbn
 import asyncio
 from aiohttp import web
 from datetime import datetime, timedelta
-
-# API Configuration
-API_PORT = int(os.getenv('API_PORT', 5000))
-API_KEY = os.getenv('API_KEY', secrets.token_hex(32))
+import psutil
 
 # Save API key for frontend
 with open(DATA_DIR / "api_key.txt", "w") as f:
@@ -3443,7 +2906,7 @@ async def handle_api_stats(request):
         return web.json_response({"error": str(e)}, status=500)
 
 async def handle_api_stock(request):
-    """GET /api/stock - Get all stock with candy metadata"""
+    """GET /api/stock - Get all stock"""
     auth = request.headers.get('Authorization', '')
     if auth != f"Bearer {API_KEY}":
         return web.json_response({"error": "Unauthorized"}, status=401)
@@ -3453,15 +2916,10 @@ async def handle_api_stock(request):
         for file in STOCK_DIR.glob("*.txt"):
             stock_type = file.stem
             count = count_stock(stock_type)
-            meta = get_candy_metadata(stock_type)
-            
             stock_data[stock_type] = {
                 "count": count,
-                "name": meta["name"],
-                "flavor": meta["flavor"],
-                "emoji": meta["emoji"],
-                "color": meta["color"],
-                "cooldown": meta["cooldown"]
+                "name": STOCK_TYPES.get(stock_type, {}).get("name", stock_type.capitalize()),
+                "emoji": STOCK_TYPES.get(stock_type, {}).get("emoji", "📄")
             }
         
         return web.json_response(stock_data)
@@ -3530,13 +2988,12 @@ async def handle_api_generate(request):
         conn.commit()
         
         remaining = count_stock(stock_type)
-        meta = get_candy_metadata(stock_type)
         
         return web.json_response({
             "success": True,
             "content": content,
             "remaining": remaining,
-            "cooldown": meta["cooldown"]
+            "cooldown": 5
         })
         
     except Exception as e:
@@ -3628,11 +3085,11 @@ async def handle_api_stock_add(request):
         if not stock_type or not content:
             return web.json_response({"error": "Missing parameters"}, status=400)
         
-        # Parse content
-        entries = StockProcessor.parse_file_content(content)
-        if entries:
-            add_stock_entries(stock_type, entries)
-            return web.json_response({"success": True, "count": len(entries)})
+        # Parse content (simple line splitting)
+        lines = [line.strip() for line in content.split('\n') if line.strip()]
+        if lines:
+            add_stock_entries(stock_type, lines)
+            return web.json_response({"success": True, "count": len(lines)})
         else:
             return web.json_response({"success": False, "error": "No valid entries"})
             
@@ -3894,11 +3351,17 @@ if __name__ == "__main__":
     print("🚀 Starting XULT - Ultimate Discord Bot")
     print("=" * 50)
     print(f"📁 Data directory: {DATA_DIR}")
+    print(f"📁 Stock directory: {STOCK_DIR}")
     print(f"🔑 API Key: {API_KEY}")
     print(f"👑 Bot Owner ID: {BOT_OWNER_ID}")
     print(f"💎 Premium Role ID: {PREMIUM_ROLE_ID}")
     print(f"🏠 Main Server ID: {MAIN_SERVER_ID}")
     print("=" * 50)
+    
+    # Create required directories
+    DATA_DIR.mkdir(exist_ok=True)
+    BACKUP_DIR.mkdir(exist_ok=True)
+    STOCK_DIR.mkdir(exist_ok=True)
     
     if not TOKEN:
         print("❌ ERROR: No bot token found! Set DISCORD_BOT_TOKEN environment variable.")
