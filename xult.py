@@ -24,6 +24,7 @@ import difflib
 from typing import List, Dict, Any, Optional
 import hashlib
 import platform
+import psutil
 
 # ==================== CONFIGURATION & SETUP ====================
 
