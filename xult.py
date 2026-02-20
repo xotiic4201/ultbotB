@@ -287,7 +287,7 @@ RIDDLES = [
     ("What can travel around the world while staying in a corner?", "stamp"),
     ("What has a head, a tail, is brown, and has no legs?", "penny"),
     ("What can be cracked, made, told, and played?", "joke"),
-    ("What has a heart that doesn’t beat?", "artichoke"),
+    ("What has a heart that doesn't beat?", "artichoke"),
     ("What comes down but never goes up?", "rain"),
     ("What can fill a room but takes up no space?", "light"),
     ("What begins with T, ends with T, and has T in it?", "teapot"),
@@ -301,7 +301,7 @@ RIDDLES = [
     ("What has teeth but cannot bite?", "comb"),
     ("What gets bigger the more you take away?", "hole"),
     ("What has many keys but cannot open a single lock?", "piano"),
-    ("What has legs but doesn’t walk?", "table"),
+    ("What has legs but doesn't walk?", "table"),
     ("What has a bed but never sleeps?", "river"),
     ("What has a bark but no bite?", "tree"),
     ("What has an ear but cannot hear?", "corn"),
@@ -2864,6 +2864,12 @@ bot.start_time = datetime.now()
 
 # ==================== API HANDLERS ====================
 
+# 🔑 NEW: API key endpoint (public)
+async def handle_api_key(request):
+    """GET /api/key - Public endpoint to get API key for frontend"""
+    # This endpoint is intentionally public so the frontend can get the key
+    return web.json_response({"key": API_KEY})
+
 async def handle_api_health(request):
     """GET /health - Health check"""
     return web.json_response({
@@ -3545,6 +3551,7 @@ async def start_api_server():
     
     # Public routes
     app.router.add_get('/health', handle_api_health)
+    app.router.add_get('/api/key', handle_api_key)  # 🔑 ADDED HERE
     
     # API routes (require API key)
     app.router.add_get('/api/stats', handle_api_stats)
@@ -3588,6 +3595,7 @@ async def start_api_server():
             await site.start()
             print(f"✅ API server running on http://0.0.0.0:{port}")
             print(f"✅ Health check available at http://0.0.0.0:{port}/health")
+            print(f"✅ API key endpoint: http://0.0.0.0:{port}/api/key")
             return
         except OSError as e:
             if attempt < max_attempts - 1:
