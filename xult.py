@@ -1,5 +1,5 @@
 # XULT - Ultimate Discord Bot
-# Merged version of all your bot files WITH API SERVER
+# Complete merged version with advanced stock processing and vending machine API
 
 import secrets
 import discord
@@ -17,15 +17,17 @@ import logging
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from matplotlib.pylab import f
 import pytz
 import xml.etree.ElementTree as ET
 from urllib.parse import quote
 import difflib
+from typing import List, Dict, Any, Optional
+import hashlib
+import psutil
+import platform
 
 # ==================== CONFIGURATION & SETUP ====================
 
-import os
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -41,10 +43,16 @@ YOUTUBE_API_KEY = os.getenv('YOUTUBE_API_KEY', '')
 TWITCH_CLIENT_ID = os.getenv('TWITCH_CLIENT_ID', '')
 TWITCH_CLIENT_SECRET = os.getenv('TWITCH_CLIENT_SECRET', '')
 TWITTER_BEARER_TOKEN = os.getenv('TWITTER_BEARER_TOKEN', '')
-GIPHY_API_KEY = os.getenv('GIPHY_API_KEY', '')
+GIPHY_API_KEY = os.getenv('GIPHY_API_KEY', 'dimlVnesALO2DLu14diWdZAAcZIgW1L1')
 
 # Bot Owner ID from environment
 BOT_OWNER_ID = int(os.getenv('BOT_OWNER_ID', '1302203907782606880'))
+
+# Premium Role ID for vending machine access
+PREMIUM_ROLE_ID = int(os.getenv('PREMIUM_ROLE_ID', '1474136325912399994'))
+
+# Main Server ID for role checks
+MAIN_SERVER_ID = int(os.getenv('MAIN_SERVER_ID', '1344385779627069541'))
 
 # API Configuration
 API_PORT = int(os.getenv('API_PORT', 5000))
@@ -64,10 +72,13 @@ c = conn.cursor()
 # Economy tables
 c.execute("""CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY,
+    username TEXT,
     coins INTEGER DEFAULT 0,
     xp INTEGER DEFAULT 0,
     level INTEGER DEFAULT 1,
-    last_daily TIMESTAMP
+    last_daily TIMESTAMP,
+    role TEXT DEFAULT 'user',
+    premium_expires TIMESTAMP
 )""")
 
 c.execute("""CREATE TABLE IF NOT EXISTS shop (
@@ -95,13 +106,93 @@ c.execute("""CREATE TABLE IF NOT EXISTS stock_usage (
     user_id INTEGER,
     stock_type TEXT,
     stock_content TEXT,
-    generated_at TIMESTAMP
+    generated_at TIMESTAMP,
+    ip_address TEXT
 )""")
 
 c.execute("""CREATE TABLE IF NOT EXISTS user_cooldowns (
     user_id INTEGER PRIMARY KEY,
     last_generated TIMESTAMP,
     generation_count INTEGER DEFAULT 0
+)""")
+
+c.execute("""CREATE TABLE IF NOT EXISTS banned_users (
+    user_id INTEGER PRIMARY KEY,
+    reason TEXT,
+    banned_at TIMESTAMP,
+    banned_by INTEGER
+)""")
+
+c.execute("""CREATE TABLE IF NOT EXISTS server_configs (
+    server_id INTEGER PRIMARY KEY,
+    config TEXT
+)""")
+
+c.execute("""CREATE TABLE IF NOT EXISTS notification_channels (
+    server_id INTEGER,
+    platform TEXT,
+    channel_id INTEGER,
+    role_id INTEGER,
+    last_post_id TEXT,
+    PRIMARY KEY (server_id, platform)
+)""")
+
+c.execute("""CREATE TABLE IF NOT EXISTS youtube_channels (
+    channel_id TEXT PRIMARY KEY,
+    server_id INTEGER,
+    last_video_id TEXT
+)""")
+
+c.execute("""CREATE TABLE IF NOT EXISTS twitch_streams (
+    username TEXT,
+    server_id INTEGER,
+    last_stream_id TEXT,
+    PRIMARY KEY (username, server_id)
+)""")
+
+c.execute("""CREATE TABLE IF NOT EXISTS twitter_accounts (
+    username TEXT,
+    server_id INTEGER,
+    last_tweet_id TEXT,
+    PRIMARY KEY (username, server_id)
+)""")
+
+c.execute("""CREATE TABLE IF NOT EXISTS moderation_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    server_id INTEGER,
+    moderator_id INTEGER,
+    user_id INTEGER,
+    action TEXT,
+    reason TEXT,
+    timestamp TIMESTAMP
+)""")
+
+c.execute("""CREATE TABLE IF NOT EXISTS warnings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    server_id INTEGER,
+    user_id INTEGER,
+    moderator_id INTEGER,
+    reason TEXT,
+    timestamp TIMESTAMP
+)""")
+
+c.execute("""CREATE TABLE IF NOT EXISTS jailed_members (
+    server_id INTEGER,
+    user_id INTEGER,
+    roles TEXT,
+    jail_time TIMESTAMP,
+    duration TEXT,
+    reason TEXT,
+    jailed_by INTEGER,
+    PRIMARY KEY (server_id, user_id)
+)""")
+
+c.execute("""CREATE TABLE IF NOT EXISTS four_twenty (
+    server_id INTEGER PRIMARY KEY,
+    channel_id INTEGER,
+    role_id INTEGER,
+    voice_channel_id INTEGER,
+    timezone TEXT DEFAULT 'UTC'
 )""")
 
 conn.commit()
@@ -140,7 +231,6 @@ def init_json_files():
     for name, file_path in JSON_FILES.items():
         if not file_path.exists():
             with open(file_path, 'w') as f:
-                # Use dictionary for all files including jailed_members
                 json.dump({}, f)
 
 def load_json(file_path, default=None):
@@ -236,60 +326,316 @@ notified_streams = {}
 # Twitter user cache
 user_id_cache = {}
 
-# Jailed members
-jailed_members = load_json(JSON_FILES["jailed_members"], {})
+# ==================== STOCK PROCESSOR CLASS ====================
 
-# ==================== ECONOMY HELPER FUNCTIONS ====================
+class StockProcessor:
+    """Process various stock file formats"""
+    
+    @staticmethod
+    def process_mega_link(line: str) -> Optional[Dict[str, Any]]:
+        """Process MEGA.nz links"""
+        mega_pattern = r'(https?://mega\.nz/(?:folder|file)/[^\s]+)'
+        match = re.search(mega_pattern, line)
+        if match:
+            return {
+                'type': 'mega',
+                'content': match.group(1),
+                'raw': line.strip(),
+                'display': f"📁 MEGA Link: {match.group(1)}"
+            }
+        return None
+    
+    @staticmethod
+    def process_rentry_link(line: str) -> Optional[Dict[str, Any]]:
+        """Process Rentry.co links"""
+        rentry_pattern = r'(https?://rentry\.co/[^\s]+)'
+        match = re.search(rentry_pattern, line)
+        if match:
+            return {
+                'type': 'rentry',
+                'content': match.group(1),
+                'raw': line.strip(),
+                'display': f"📝 Rentry: {match.group(1)}"
+            }
+        return None
+    
+    @staticmethod
+    def process_email_pass(line: str) -> Optional[Dict[str, Any]]:
+        """Process email:password combinations"""
+        separators = [':', '|', ';']
+        
+        for separator in separators:
+            if separator in line:
+                parts = line.split(separator, 1)
+                email = parts[0].strip()
+                password = parts[1].strip()
+                
+                email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+                if re.match(email_pattern, email) and len(password) > 3:
+                    return {
+                        'type': 'emailpass',
+                        'email': email,
+                        'password': password,
+                        'content': f"{email}:{password}",
+                        'raw': line.strip(),
+                        'display': f"📧 Email: {email}\n🔑 Password: {password}"
+                    }
+        return None
+    
+    @staticmethod
+    def process_account_line(line: str) -> Optional[Dict[str, Any]]:
+        """Process username:password format"""
+        if ':' in line and not re.search(r'https?://', line):
+            parts = line.split(':', 1)
+            username = parts[0].strip()
+            password = parts[1].strip()
+            
+            if not re.match(r'^[a-zA-Z0-9._%+-]+@', username) and len(username) > 2:
+                return {
+                    'type': 'account',
+                    'username': username,
+                    'password': password,
+                    'content': f"{username}:{password}",
+                    'raw': line.strip(),
+                    'display': f"👤 Username: {username}\n🔑 Password: {password}"
+                }
+        return None
+    
+    @staticmethod
+    def process_game_account(line: str) -> Optional[Dict[str, Any]]:
+        """Process game account formats"""
+        line_lower = line.lower()
+        
+        if 'ubisoft' in line_lower or 'uplay' in line_lower:
+            email_match = re.search(r'([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}):([^\s|]+)', line)
+            if email_match:
+                return {
+                    'type': 'ubisoft',
+                    'email': email_match.group(1),
+                    'password': email_match.group(2),
+                    'content': line.strip(),
+                    'display': f"🎮 Ubisoft Account\nEmail: {email_match.group(1)}\nPassword: {email_match.group(2)}"
+                }
+        
+        steam_match = re.search(r'Account:\s*([^:]+):([^\s]+)', line)
+        if steam_match:
+            return {
+                'type': 'steam',
+                'username': steam_match.group(1).strip(),
+                'password': steam_match.group(2).strip(),
+                'content': line.strip(),
+                'display': f"🎮 Steam Account\nUsername: {steam_match.group(1).strip()}\nPassword: {steam_match.group(2).strip()}"
+            }
+        
+        if 'epic' in line_lower:
+            epic_match = re.search(r'([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}):([^\s]+)', line)
+            if epic_match:
+                return {
+                    'type': 'epicgames',
+                    'email': epic_match.group(1),
+                    'password': epic_match.group(2),
+                    'content': line.strip(),
+                    'display': f"🎮 Epic Games Account\nEmail: {epic_match.group(1)}\nPassword: {epic_match.group(2)}"
+                }
+        
+        return None
+    
+    @staticmethod
+    def process_roblox_account(line: str) -> Optional[Dict[str, Any]]:
+        """Process Roblox account format"""
+        roblox_pattern = r'https?://(?:www\.)?roblox\.com/[^\s:]+:([^:]+):([^\s|]+)'
+        match = re.search(roblox_pattern, line)
+        if match:
+            return {
+                'type': 'roblox',
+                'username': match.group(1),
+                'password': match.group(2),
+                'content': line.strip(),
+                'display': f"🎮 Roblox Account\nUsername: {match.group(1)}\nPassword: {match.group(2)}"
+            }
+        return None
+    
+    @staticmethod
+    def process_instagram_account(line: str) -> Optional[Dict[str, Any]]:
+        """Process Instagram account format"""
+        insta_pattern = r'([a-zA-Z0-9._%+-]+(?::|:)[^\s]+)'
+        match = re.search(insta_pattern, line)
+        if match and ('instagram' in line.lower() or 'ig:' in line.lower()):
+            parts = match.group(1).split(':', 1)
+            return {
+                'type': 'instagram',
+                'username': parts[0],
+                'password': parts[1],
+                'content': line.strip(),
+                'display': f"📸 Instagram\nUsername: {parts[0]}\nPassword: {parts[1]}"
+            }
+        return None
+    
+    @staticmethod
+    def process_onlyfans_account(line: str) -> Optional[Dict[str, Any]]:
+        """Process OnlyFans account format"""
+        if 'onlyfans' in line.lower():
+            email_match = re.search(r'([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}):([^\s]+)', line)
+            if email_match:
+                return {
+                    'type': 'onlyfans',
+                    'email': email_match.group(1),
+                    'password': email_match.group(2),
+                    'content': line.strip(),
+                    'display': f"🔞 OnlyFans Account\nEmail: {email_match.group(1)}\nPassword: {email_match.group(2)}"
+                }
+        return None
+    
+    @staticmethod
+    def process_nitro_code(line: str) -> Optional[Dict[str, Any]]:
+        """Process Discord Nitro codes"""
+        nitro_pattern = r'(?:https?://)?discord\.gift/([a-zA-Z0-9]+)'
+        match = re.search(nitro_pattern, line)
+        if match:
+            return {
+                'type': 'nitro',
+                'code': match.group(1),
+                'content': f"https://discord.gift/{match.group(1)}",
+                'display': f"💎 Nitro Code: `{match.group(1)}`\nLink: https://discord.gift/{match.group(1)}"
+            }
+        return None
+    
+    @staticmethod
+    def process_spotify_account(line: str) -> Optional[Dict[str, Any]]:
+        """Process Spotify account format"""
+        if 'spotify' in line.lower():
+            email_match = re.search(r'([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}):([^\s]+)', line)
+            if email_match:
+                return {
+                    'type': 'spotify',
+                    'email': email_match.group(1),
+                    'password': email_match.group(2),
+                    'content': line.strip(),
+                    'display': f"🎵 Spotify Account\nEmail: {email_match.group(1)}\nPassword: {email_match.group(2)}"
+                }
+        return None
+    
+    @staticmethod
+    def process_netflix_account(line: str) -> Optional[Dict[str, Any]]:
+        """Process Netflix account format"""
+        if 'netflix' in line.lower():
+            email_match = re.search(r'([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}):([^\s]+)', line)
+            if email_match:
+                return {
+                    'type': 'netflix',
+                    'email': email_match.group(1),
+                    'password': email_match.group(2),
+                    'content': line.strip(),
+                    'display': f"🎬 Netflix Account\nEmail: {email_match.group(1)}\nPassword: {email_match.group(2)}"
+                }
+        return None
+    
+    @staticmethod
+    def process_line(line: str) -> List[Dict[str, Any]]:
+        """Process a single line and return all found entries"""
+        entries = []
+        
+        line = line.strip()
+        if not line or line.startswith('#'):
+            return entries
+        
+        processors = [
+            StockProcessor.process_mega_link,
+            StockProcessor.process_rentry_link,
+            StockProcessor.process_nitro_code,
+            StockProcessor.process_roblox_account,
+            StockProcessor.process_game_account,
+            StockProcessor.process_instagram_account,
+            StockProcessor.process_onlyfans_account,
+            StockProcessor.process_spotify_account,
+            StockProcessor.process_netflix_account,
+            StockProcessor.process_email_pass,
+            StockProcessor.process_account_line
+        ]
+        
+        for processor in processors:
+            result = processor(line)
+            if result:
+                entries.append(result)
+        
+        if not entries and line:
+            entries.append({
+                'type': 'generic',
+                'content': line,
+                'raw': line,
+                'display': line
+            })
+        
+        return entries
+    
+    @staticmethod
+    def parse_file_content(content: str, filename: str = None) -> List[Dict[str, Any]]:
+        """Parse entire file content and categorize entries"""
+        all_entries = []
+        lines = content.split('\n')
+        
+        for line in lines:
+            entries = StockProcessor.process_line(line)
+            for entry in entries:
+                if filename:
+                    entry['source'] = filename
+                all_entries.append(entry)
+        
+        return all_entries
+    
+    @staticmethod
+    def determine_stock_type(content: str, filename: str = None) -> str:
+        """Determine the best stock type based on content"""
+        content_lower = content.lower()
+        
+        if filename:
+            filename_lower = filename.lower()
+            if 'onlyfans' in filename_lower:
+                return 'onlyfans'
+            elif 'instagram' in filename_lower:
+                return 'instagram'
+            elif 'roblox' in filename_lower:
+                return 'roblox'
+            elif 'steam' in filename_lower:
+                return 'steam'
+            elif 'epic' in filename_lower:
+                return 'epicgames'
+            elif 'ubisoft' in filename_lower:
+                return 'ubisoft'
+            elif 'nitro' in filename_lower or 'discord' in filename_lower:
+                return 'discord_nitro'
+            elif 'spotify' in filename_lower:
+                return 'spotify'
+            elif 'netflix' in filename_lower:
+                return 'netflix'
+        
+        if re.search(r'mega\.nz', content_lower):
+            return 'mega_links'
+        elif re.search(r'rentry\.co', content_lower):
+            return 'rentry_links'
+        elif re.search(r'discord\.gift', content_lower):
+            return 'discord_nitro'
+        elif re.search(r'roblox\.com', content_lower):
+            return 'roblox'
+        elif re.search(r'instagram', content_lower):
+            return 'instagram'
+        elif re.search(r'onlyfans', content_lower):
+            return 'onlyfans'
+        elif re.search(r'spotify', content_lower):
+            return 'spotify'
+        elif re.search(r'netflix', content_lower):
+            return 'netflix'
+        elif re.search(r'steam', content_lower):
+            return 'steam'
+        elif re.search(r'ubisoft|uplay', content_lower):
+            return 'ubisoft'
+        elif re.search(r'epicgames|epic games', content_lower):
+            return 'epicgames'
+        elif re.search(r'@gmail|@yahoo|@hotmail', content_lower):
+            return 'email_accounts'
+        else:
+            return 'accounts'
 
-def get_balance(user_id: int) -> int:
-    c.execute("INSERT OR IGNORE INTO users (id, coins) VALUES (?, 0)", (user_id,))
-    conn.commit()
-    c.execute("SELECT coins FROM users WHERE id = ?", (user_id,))
-    row = c.fetchone()
-    return row[0] if row else 0
-
-def add_coins(user_id: int, amount: int):
-    c.execute("INSERT OR IGNORE INTO users (id, coins) VALUES (?, 0)", (user_id,))
-    conn.commit()
-    c.execute("UPDATE users SET coins = coins + ? WHERE id = ?", (amount, user_id))
-    conn.commit()
-
-def remove_coins(user_id: int, amount: int):
-    current = get_balance(user_id)
-    new_balance = max(current - amount, 0)
-    c.execute("UPDATE users SET coins = ? WHERE id = ?", (new_balance, user_id))
-    conn.commit()
-
-def get_xp(user_id: int) -> int:
-    c.execute("INSERT OR IGNORE INTO users (id, xp) VALUES (?, 0)", (user_id,))
-    conn.commit()
-    c.execute("SELECT xp FROM users WHERE id = ?", (user_id,))
-    row = c.fetchone()
-    return row[0] if row else 0
-
-def get_level(user_id: int) -> int:
-    c.execute("INSERT OR IGNORE INTO users (id, level) VALUES (?, 1)", (user_id,))
-    conn.commit()
-    c.execute("SELECT level FROM users WHERE id = ?", (user_id,))
-    row = c.fetchone()
-    return row[0] if row else 1
-
-def add_xp(user_id: int, amount: int):
-    c.execute("INSERT OR IGNORE INTO users (id, xp) VALUES (?, 0)", (user_id,))
-    conn.commit()
-    c.execute("UPDATE users SET xp = xp + ? WHERE id = ?", (amount, user_id))
-    conn.commit()
-    return check_level_up(user_id)
-
-def check_level_up(user_id: int):
-    xp = get_xp(user_id)
-    level = get_level(user_id)
-    if xp >= level * 100:
-        new_level = level + 1
-        c.execute("UPDATE users SET level = ? WHERE id = ?", (new_level, user_id))
-        conn.commit()
-        return new_level
-    return None
 
 # ==================== STOCK/GEN HELPER FUNCTIONS ====================
 
@@ -297,7 +643,9 @@ STOCK_DIR = DATA_DIR / "stock"
 STOCK_DIR.mkdir(exist_ok=True)
 
 def get_stock_filename(stock_type: str):
-    return STOCK_DIR / f"{stock_type.lower().strip()}.txt"
+    """Get filename for stock type"""
+    stock_type = stock_type.lower().strip().replace(' ', '_')
+    return STOCK_DIR / f"{stock_type}.txt"
 
 def create_stock_file(stock_type: str):
     filename = get_stock_filename(stock_type)
@@ -307,39 +655,80 @@ def create_stock_file(stock_type: str):
 def count_stock(stock_type: str) -> int:
     filename = get_stock_filename(stock_type)
     create_stock_file(stock_type)
-    content = filename.read_text(encoding="utf-8").strip()
-    return len(content.split("\n\n")) if "\n\n" in content else len(content.splitlines()) if content else 0
+    
+    try:
+        content = filename.read_text(encoding="utf-8").strip()
+        if not content:
+            return 0
+        
+        if content.startswith('[') and content.endswith(']'):
+            try:
+                entries = json.loads(content)
+                return len(entries) if isinstance(entries, list) else 0
+            except:
+                pass
+        
+        return len([l for l in content.split('\n') if l.strip()])
+    except:
+        return 0
 
 def read_stock_entries(stock_type: str) -> list:
     filename = get_stock_filename(stock_type)
-    if not filename.exists():
+    create_stock_file(stock_type)
+    
+    try:
+        content = filename.read_text(encoding="utf-8").strip()
+        if not content:
+            return []
+        
+        if content.startswith('[') and content.endswith(']'):
+            try:
+                entries = json.loads(content)
+                return entries if isinstance(entries, list) else []
+            except:
+                pass
+        
+        return [line.strip() for line in content.split('\n') if line.strip()]
+    except:
         return []
-    content = filename.read_text(encoding="utf-8").strip()
-    return content.split("\n\n") if "\n\n" in content else content.splitlines() if content else []
 
 def write_stock_entries(stock_type: str, entries: list):
     filename = get_stock_filename(stock_type)
-    filename.write_text("\n\n".join(entries), encoding="utf-8")
+    
+    if entries and isinstance(entries[0], dict):
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(entries, f, indent=2)
+    else:
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write('\n'.join(str(e) for e in entries))
 
-def get_stock_entry(stock_type: str):
+def add_stock_entries(stock_type: str, new_entries: list):
+    current = read_stock_entries(stock_type)
+    
+    if current and isinstance(current[0], dict) and new_entries and isinstance(new_entries[0], dict):
+        current.extend(new_entries)
+    elif current and isinstance(current[0], str) and new_entries and isinstance(new_entries[0], str):
+        current.extend(new_entries)
+    else:
+        current = [str(e) for e in current]
+        new_entries_str = [str(e) for e in new_entries]
+        current.extend(new_entries_str)
+    
+    write_stock_entries(stock_type, current)
+
+def get_stock_entry(stock_type: str) -> Optional[str]:
     """Get first entry and remove it"""
-    file = get_stock_filename(stock_type)
-    if not file.exists():
-        return None
-    
-    content = file.read_text(encoding="utf-8").strip()
-    if not content:
-        return None
-    
-    entries = [x.strip() for x in content.split("\n\n") if x.strip()]
+    entries = read_stock_entries(stock_type)
     if not entries:
         return None
     
     first = entries[0]
-    remaining = "\n\n".join(entries[1:])
-    file.write_text(remaining, encoding="utf-8")
+    remaining = entries[1:]
+    write_stock_entries(stock_type, remaining)
     
-    return first
+    if isinstance(first, dict):
+        return first.get('display', first.get('content', str(first)))
+    return str(first)
 
 def is_on_cooldown(user_id: int) -> tuple:
     timeout = CUSTOM_USER_TIMEOUT if user_id == CUSTOM_USER_ID else FREE_GEN_TIMEOUT
@@ -351,6 +740,126 @@ def is_on_cooldown(user_id: int) -> tuple:
 
 def set_cooldown(user_id: int):
     user_cooldowns[user_id] = time.time()
+
+# ==================== CANDY METADATA ====================
+
+CANDY_DEFAULTS = {
+    "nitro": {
+        "name": "Nitro Blast",
+        "flavor": "Blue Raspberry",
+        "emoji": "💎",
+        "color": "from-purple-500 to-pink-500",
+        "cooldown": 5
+    },
+    "spotify": {
+        "name": "Spotify Sours",
+        "flavor": "Green Apple",
+        "emoji": "🎵",
+        "color": "from-green-500 to-emerald-500",
+        "cooldown": 5
+    },
+    "netflix": {
+        "name": "Netflix Nibs",
+        "flavor": "Cherry",
+        "emoji": "🎬",
+        "color": "from-red-500 to-rose-500",
+        "cooldown": 5
+    },
+    "steam": {
+        "name": "Steam Drops",
+        "flavor": "Cola",
+        "emoji": "🎮",
+        "color": "from-gray-700 to-gray-900",
+        "cooldown": 5
+    },
+    "discord_nitro": {
+        "name": "Discord Dots",
+        "flavor": "Blueberry",
+        "emoji": "💬",
+        "color": "from-indigo-500 to-purple-500",
+        "cooldown": 5
+    },
+    "minecraft": {
+        "name": "Minecraft Blocks",
+        "flavor": "Melon",
+        "emoji": "⛏️",
+        "color": "from-green-700 to-lime-600",
+        "cooldown": 5
+    },
+    "roblox": {
+        "name": "Roblox Rocks",
+        "flavor": "Mixed Berry",
+        "emoji": "🎮",
+        "color": "from-red-500 to-orange-500",
+        "cooldown": 5
+    },
+    "epicgames": {
+        "name": "Epic Energy",
+        "flavor": "Tropical",
+        "emoji": "⚡",
+        "color": "from-purple-500 to-blue-500",
+        "cooldown": 5
+    },
+    "ubisoft": {
+        "name": "Ubisoft Bites",
+        "flavor": "Grape",
+        "emoji": "🎯",
+        "color": "from-blue-500 to-indigo-500",
+        "cooldown": 5
+    },
+    "instagram": {
+        "name": "Insta Drops",
+        "flavor": "Pink Lemonade",
+        "emoji": "📸",
+        "color": "from-pink-500 to-orange-500",
+        "cooldown": 5
+    },
+    "onlyfans": {
+        "name": "Only Candies",
+        "flavor": "Passion Fruit",
+        "emoji": "🔞",
+        "color": "from-red-500 to-pink-500",
+        "cooldown": 5
+    },
+    "mega_links": {
+        "name": "Mega Mix",
+        "flavor": "Mixed",
+        "emoji": "📁",
+        "color": "from-blue-500 to-cyan-500",
+        "cooldown": 5
+    },
+    "rentry_links": {
+        "name": "Rentry Drops",
+        "flavor": "Mixed",
+        "emoji": "📝",
+        "color": "from-gray-500 to-gray-700",
+        "cooldown": 5
+    },
+    "email_accounts": {
+        "name": "Email Treats",
+        "flavor": "Mixed",
+        "emoji": "📧",
+        "color": "from-yellow-500 to-orange-500",
+        "cooldown": 5
+    },
+    "accounts": {
+        "name": "Account Mix",
+        "flavor": "Mixed",
+        "emoji": "👤",
+        "color": "from-purple-500 to-pink-500",
+        "cooldown": 5
+    }
+}
+
+def get_candy_metadata(stock_type: str) -> dict:
+    """Get candy metadata for a stock type"""
+    return CANDY_DEFAULTS.get(stock_type, {
+        "name": stock_type.replace('_', ' ').title(),
+        "flavor": "Mixed",
+        "emoji": "🍬",
+        "color": "from-purple-500 to-pink-500",
+        "cooldown": 5
+    })
 
 # ==================== MODERATION HELPER FUNCTIONS ====================
 
@@ -1034,10 +1543,10 @@ async def check_twitch():
 @tasks.loop(seconds=30)
 async def check_unjail():
     now = datetime.utcnow()
-    jailed_members = load_json(JSON_FILES["jailed_members"], {})  # This already uses {} as default
+    jailed_members = load_json(JSON_FILES["jailed_members"], {})
     updated = False
     
-    for guild_id, members in list(jailed_members.items()):  # This is correct, jailed_members is dict
+    for guild_id, members in list(jailed_members.items()):
         guild = bot.get_guild(int(guild_id))
         if not guild:
             continue
@@ -1054,10 +1563,8 @@ async def check_unjail():
                         await unjail_member(member, reason="Jail time expired")
                         updated = True
                         
-                        # Remove from jailed_members dict
                         del jailed_members[guild_id][member_id]
                         
-                        # Clean up empty guild entries
                         if not jailed_members[guild_id]:
                             del jailed_members[guild_id]
             except Exception as e:
@@ -1066,8 +1573,6 @@ async def check_unjail():
     
     if updated:
         save_json(JSON_FILES["jailed_members"], jailed_members)
-    
-
 
 async def unjail_member(member: discord.Member, reason: str = "Jail time expired"):
     guild_id = str(member.guild.id)
@@ -1451,7 +1956,13 @@ async def help_command(interaction: discord.Interaction):
     
     embed.add_field(
         name="📦 **Stock/Generator**",
-        value="`/addstock` `/deletestock` `/gen` `/dmgen` `/setgenaccess` `/setautoupdate`",
+        value="`/addstock` `/deletestock` `/gen` `/dmgen` `/setgenaccess` `/setautoupdate` `/stocklist`",
+        inline=False
+    )
+    
+    embed.add_field(
+        name="🍬 **Candy Vending**",
+        value="`/candy` `/candylist`",
         inline=False
     )
     
@@ -1488,6 +1999,73 @@ async def help_command(interaction: discord.Interaction):
     embed.set_footer(text="XULT - The Ultimate Discord Bot • Support: https://discord.gg/pQBKywjW7h")
     
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="candy", description="🍬 Access the candy vending machine")
+async def candy(interaction: discord.Interaction):
+    """Open the candy vending machine (premium only)"""
+    
+    # Check if user has premium role
+    has_premium = False
+    if interaction.guild and interaction.guild.id == MAIN_SERVER_ID:
+        premium_role = interaction.guild.get_role(PREMIUM_ROLE_ID)
+        if premium_role and premium_role in interaction.user.roles:
+            has_premium = True
+    
+    if not has_premium:
+        embed = discord.Embed(
+            title="🍬 Premium Required",
+            description="You need the **Premium** role to access the candy vending machine.",
+            color=discord.Color.red()
+        )
+        embed.add_field(name="Role ID", value=f"`{PREMIUM_ROLE_ID}`", inline=False)
+        embed.add_field(name="Server", value=f"Join the main server to get premium!", inline=False)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+    
+    # Get stock info
+    stock_info = []
+    for file in STOCK_DIR.glob("*.txt"):
+        stock_type = file.stem
+        count = count_stock(stock_type)
+        meta = get_candy_metadata(stock_type)
+        stock_info.append(f"{meta['emoji']} **{meta['name']}**: {count} left")
+    
+    embed = discord.Embed(
+        title="🍬 Candy Vending Machine",
+        description="Welcome to the candy vending machine! Use `/gen <type>` to dispense candy.",
+        color=discord.Color.pink()
+    )
+    embed.add_field(name="Available Candy", value="\n".join(stock_info) if stock_info else "No candy available", inline=False)
+    embed.add_field(name="Cooldown", value="5 seconds per generation", inline=True)
+    embed.add_field(name="Premium Role", value=f"<@&{PREMIUM_ROLE_ID}>", inline=True)
+    
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="candylist", description="🍬 List all available candy types")
+async def candylist(interaction: discord.Interaction):
+    """List all available candy types with counts"""
+    
+    embed = discord.Embed(
+        title="🍬 Candy Menu",
+        color=discord.Color.pink()
+    )
+    
+    for file in STOCK_DIR.glob("*.txt"):
+        stock_type = file.stem
+        count = count_stock(stock_type)
+        meta = get_candy_metadata(stock_type)
+        
+        status = "🟢" if count > 10 else "🟡" if count > 0 else "🔴"
+        embed.add_field(
+            name=f"{meta['emoji']} {meta['name']}",
+            value=f"{status} {count} left\n*{meta['flavor']}*",
+            inline=True
+        )
+    
+    if not embed.fields:
+        embed.description = "No candy available!"
+    
+    await interaction.response.send_message(embed=embed)
 
 # ==================== ECONOMY COMMANDS ====================
 
@@ -2135,18 +2713,17 @@ async def addstock(interaction: discord.Interaction, stock_type: str, file: disc
         return
     
     if file and file.filename.endswith(".txt"):
-        stock_filename = get_stock_filename(stock_type)
-        uploaded_content = await file.read()
-        content = uploaded_content.decode("utf-8").strip()
+        # Parse the uploaded file
+        content = await file.read()
+        decoded = content.decode("utf-8", errors="ignore")
+        entries = StockProcessor.parse_file_content(decoded, filename=file.filename)
         
-        if stock_filename.exists():
-            with open(stock_filename, "a", encoding="utf-8") as f:
-                f.write("\n\n" + content)
-            await interaction.response.send_message(f"✅ Appended to existing {stock_type} stock file.", ephemeral=True)
+        if entries:
+            add_stock_entries(stock_type, entries)
+            await interaction.response.send_message(f"✅ Added {len(entries)} entries to **{stock_type}** stock!", ephemeral=True)
+            await send_auto_update()
         else:
-            with open(stock_filename, "w", encoding="utf-8") as f:
-                f.write(content)
-            await interaction.response.send_message(f"✅ Created new {stock_type} stock file.", ephemeral=True)
+            await interaction.response.send_message("⚠️ No valid entries found in the file.", ephemeral=True)
     else:
         await interaction.response.send_message(f"📂 Upload a .txt file for {stock_type}.", ephemeral=True)
 
@@ -2167,34 +2744,62 @@ async def deletestock(interaction: discord.Interaction):
 
 @bot.tree.command(name="gen", description="Generate a stock entry")
 async def gen(interaction: discord.Interaction, stock_type: str):
-    gen_access = load_json(JSON_FILES["gen_access"], {})
-    guild_id = str(interaction.guild.id)
-    allowed_roles = gen_access.get(guild_id, [])
+    """Generate a stock entry - premium role required in main server"""
     
-    if not any(role.id in allowed_roles for role in interaction.user.roles):
-        await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
+    # Check premium role in main server
+    main_guild = bot.get_guild(MAIN_SERVER_ID)
+    if main_guild:
+        member = main_guild.get_member(interaction.user.id)
+        if not member:
+            embed = discord.Embed(
+                title="❌ Premium Required",
+                description=f"You need to be in the main server to use this command.\nJoin and get the premium role!",
+                color=discord.Color.red()
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+        
+        premium_role = main_guild.get_role(PREMIUM_ROLE_ID)
+        if not premium_role or premium_role not in member.roles:
+            embed = discord.Embed(
+                title="❌ Premium Required",
+                description=f"You need the premium role <@&{PREMIUM_ROLE_ID}> to use this command.",
+                color=discord.Color.red()
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+    else:
+        await interaction.response.send_message("❌ Cannot verify premium status. Main server not accessible.", ephemeral=True)
         return
     
     await interaction.response.defer()
     
+    # Check cooldown
     is_cooldown, remaining = is_on_cooldown(interaction.user.id)
     if is_cooldown:
         await interaction.followup.send(f"⏳ You must wait `{remaining}` seconds before using this again.")
         return
     
-    entries = read_stock_entries(stock_type)
-    if not entries:
+    # Get stock entry
+    stock_info = get_stock_entry(stock_type)
+    if not stock_info:
         await interaction.followup.send(f"❌ No stock available for {stock_type}.")
         return
     
-    stock_info = entries.pop(0).strip()
-    write_stock_entries(stock_type, entries)
+    # Set cooldown
     set_cooldown(interaction.user.id)
     
+    # Send to DMs
     try:
         await interaction.user.send(f"```\n{stock_info}\n```")
         await interaction.followup.send(f"📩 Stock sent to your DMs!")
-    except:
+        
+        # Log usage
+        c.execute("INSERT INTO stock_usage (user_id, stock_type, stock_content, generated_at) VALUES (?, ?, ?, ?)",
+                 (interaction.user.id, stock_type, stock_info, datetime.now().isoformat()))
+        conn.commit()
+        
+    except discord.Forbidden:
         await interaction.followup.send(f"❌ Unable to send DM. Please enable DMs.")
     
     await send_auto_update()
@@ -2260,6 +2865,30 @@ async def setautoupdate(interaction: discord.Interaction, channel: discord.TextC
     save_json(JSON_FILES["auto_update"], auto_update)
     
     await interaction.response.send_message(f"✅ Auto-update set to {channel.mention} with role {role.mention}.", ephemeral=False)
+
+@bot.tree.command(name="stocklist", description="List all available stock types")
+async def stocklist(interaction: discord.Interaction):
+    """List all available stock types with counts"""
+    
+    embed = discord.Embed(
+        title="📦 Stock List",
+        color=discord.Color.blue()
+    )
+    
+    for file in STOCK_DIR.glob("*.txt"):
+        stock_type = file.stem
+        count = count_stock(stock_type)
+        meta = get_candy_metadata(stock_type)
+        embed.add_field(
+            name=f"{meta['emoji']} {meta['name']}",
+            value=f"`{count}` left\n*{meta['flavor']}*",
+            inline=True
+        )
+    
+    if not embed.fields:
+        embed.description = "No stock available!"
+    
+    await interaction.response.send_message(embed=embed)
 
 # ==================== SERVER MANAGEMENT COMMANDS ====================
 
@@ -2586,10 +3215,6 @@ async def test(interaction: discord.Interaction):
     )
     await interaction.response.send_message("✅ Test message sent!", ephemeral=True)
 
-# ==================== ANTI-NUKE COMMANDS ====================
-
-
-
 # ==================== FUN COMMANDS ====================
 
 @bot.tree.command(name="gif", description="Get a GIF from GIPHY")
@@ -2773,6 +3398,13 @@ print(f"📡 API Server will start on port {API_PORT}")
 
 # ==================== API ROUTES ====================
 
+async def handle_api_health(request):
+    """GET /health - Health check"""
+    return web.json_response({
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat()
+    })
+
 async def handle_api_stats(request):
     """GET /api/stats - Get bot statistics"""
     auth = request.headers.get('Authorization', '')
@@ -2780,7 +3412,6 @@ async def handle_api_stats(request):
         return web.json_response({"error": "Unauthorized"}, status=401)
     
     try:
-        # Get stats from database
         c.execute("SELECT COUNT(DISTINCT id) FROM users")
         total_users = c.fetchone()[0] or 0
         
@@ -2821,31 +3452,17 @@ async def handle_api_stock(request):
     try:
         stock_data = {}
         for file in STOCK_DIR.glob("*.txt"):
-            if file.name.endswith('.meta.json'):
-                continue
-            
             stock_type = file.stem
             count = count_stock(stock_type)
-            
-            # Candy defaults
-            defaults = {
-                "nitro": {"name": "Nitro Blast", "flavor": "Blue Raspberry", "emoji": "💎", "color": "from-purple-500 to-pink-500"},
-                "spotify": {"name": "Spotify Sours", "flavor": "Green Apple", "emoji": "🎵", "color": "from-green-500 to-emerald-500"},
-                "netflix": {"name": "Netflix Nibs", "flavor": "Cherry", "emoji": "🎬", "color": "from-red-500 to-rose-500"},
-                "steam": {"name": "Steam Drops", "flavor": "Cola", "emoji": "🎮", "color": "from-gray-700 to-gray-900"},
-                "discord": {"name": "Discord Dots", "flavor": "Blueberry", "emoji": "💬", "color": "from-indigo-500 to-purple-500"},
-                "minecraft": {"name": "Minecraft Blocks", "flavor": "Melon", "emoji": "⛏️", "color": "from-green-700 to-lime-600"}
-            }
-            
-            d = defaults.get(stock_type, {"name": stock_type.capitalize(), "flavor": "Mixed", "emoji": "🍬", "color": "from-purple-500 to-pink-500"})
+            meta = get_candy_metadata(stock_type)
             
             stock_data[stock_type] = {
                 "count": count,
-                "name": d["name"],
-                "flavor": d["flavor"],
-                "emoji": d["emoji"],
-                "color": d["color"],
-                "cooldown": 5
+                "name": meta["name"],
+                "flavor": meta["flavor"],
+                "emoji": meta["emoji"],
+                "color": meta["color"],
+                "cooldown": meta["cooldown"]
             }
         
         return web.json_response(stock_data)
@@ -2862,16 +3479,28 @@ async def handle_api_generate(request):
         stock_type = request.match_info.get('type')
         data = await request.json()
         user_id = data.get('userId')
+        ip = request.remote
         
         if not user_id or not stock_type:
             return web.json_response({"error": "Missing parameters"}, status=400)
         
-        # Check premium
-        c.execute("SELECT * FROM premium_users WHERE user_id = ? AND is_active = 1", (user_id,))
-        premium = c.fetchone()
+        # Check if user is banned
+        c.execute("SELECT * FROM banned_users WHERE user_id = ?", (user_id,))
+        if c.fetchone():
+            return web.json_response({"success": False, "error": "User is banned"})
         
-        if not premium:
-            return web.json_response({"success": False, "error": "Premium role required"})
+        # Check premium status (in main server)
+        main_guild = bot.get_guild(MAIN_SERVER_ID)
+        if main_guild:
+            member = main_guild.get_member(int(user_id))
+            if not member:
+                return web.json_response({"success": False, "error": "User not in main server"})
+            
+            premium_role = main_guild.get_role(PREMIUM_ROLE_ID)
+            if not premium_role or premium_role not in member.roles:
+                return web.json_response({"success": False, "error": "Premium role required"})
+        else:
+            return web.json_response({"success": False, "error": "Cannot verify premium status"})
         
         # Check cooldown
         c.execute("SELECT last_generated FROM user_cooldowns WHERE user_id = ?", (user_id,))
@@ -2892,8 +3521,8 @@ async def handle_api_generate(request):
             return web.json_response({"success": False, "error": "Out of stock"})
         
         # Log usage
-        c.execute("INSERT INTO stock_usage (user_id, stock_type, stock_content, generated_at) VALUES (?, ?, ?, ?)",
-                 (user_id, stock_type, content, datetime.now().isoformat()))
+        c.execute("INSERT INTO stock_usage (user_id, stock_type, stock_content, generated_at, ip_address) VALUES (?, ?, ?, ?, ?)",
+                 (user_id, stock_type, content, datetime.now().isoformat(), ip))
         
         # Update cooldown
         c.execute("INSERT OR REPLACE INTO user_cooldowns (user_id, last_generated, generation_count) VALUES (?, ?, COALESCE((SELECT generation_count + 1 FROM user_cooldowns WHERE user_id = ?), 1))",
@@ -2902,12 +3531,13 @@ async def handle_api_generate(request):
         conn.commit()
         
         remaining = count_stock(stock_type)
+        meta = get_candy_metadata(stock_type)
         
         return web.json_response({
             "success": True,
             "content": content,
             "remaining": remaining,
-            "cooldown": 5
+            "cooldown": meta["cooldown"]
         })
         
     except Exception as e:
@@ -2922,11 +3552,16 @@ async def handle_api_check_premium(request):
     try:
         user_id = int(request.match_info.get('user_id'))
         
-        c.execute("SELECT * FROM premium_users WHERE user_id = ? AND is_active = 1", (user_id,))
-        if c.fetchone():
-            return web.json_response({"hasPremium": True})
+        # Check in main server
+        main_guild = bot.get_guild(MAIN_SERVER_ID)
+        if main_guild:
+            member = main_guild.get_member(user_id)
+            if member:
+                premium_role = main_guild.get_role(PREMIUM_ROLE_ID)
+                if premium_role and premium_role in member.roles:
+                    return web.json_response({"hasPremium": True, "roles": [str(r.id) for r in member.roles]})
         
-        return web.json_response({"hasPremium": False})
+        return web.json_response({"hasPremium": False, "roles": []})
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
 
@@ -2942,14 +3577,19 @@ async def handle_api_user(request):
         c.execute("SELECT coins, xp, level FROM users WHERE id = ?", (user_id,))
         row = c.fetchone()
         
+        if not row:
+            c.execute("INSERT INTO users (id, coins, xp, level) VALUES (?, 0, 0, 1)", (user_id,))
+            conn.commit()
+            row = (0, 0, 1)
+        
         # Get rank
         c.execute("SELECT COUNT(*) FROM users WHERE coins > (SELECT coins FROM users WHERE id = ?)", (user_id,))
-        rank = c.fetchone()[0] + 1 if row else 0
+        rank = c.fetchone()[0] + 1
         
         return web.json_response({
-            "coins": row[0] if row else 0,
-            "xp": row[1] if row else 0,
-            "level": row[2] if row else 1,
+            "coins": row[0],
+            "xp": row[1],
+            "level": row[2],
             "rank": rank
         })
     except Exception as e:
@@ -2967,7 +3607,7 @@ async def handle_api_leaderboard(request):
         for user_id, username, coins in c.fetchall():
             users.append({
                 "id": user_id,
-                "username": username,
+                "username": username or f"User-{user_id}",
                 "coins": coins
             })
         
@@ -2989,27 +3629,211 @@ async def handle_api_stock_add(request):
         if not stock_type or not content:
             return web.json_response({"error": "Missing parameters"}, status=400)
         
-        file = get_stock_filename(stock_type)
-        
-        if file.exists():
-            current = file.read_text(encoding="utf-8").strip()
-            if current:
-                file.write_text(current + "\n\n" + content, encoding="utf-8")
-            else:
-                file.write_text(content, encoding="utf-8")
+        # Parse content
+        entries = StockProcessor.parse_file_content(content)
+        if entries:
+            add_stock_entries(stock_type, entries)
+            return web.json_response({"success": True, "count": len(entries)})
         else:
-            file.write_text(content, encoding="utf-8")
-        
-        return web.json_response({"success": True})
+            return web.json_response({"success": False, "error": "No valid entries"})
+            
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
 
-async def handle_api_health(request):
-    """GET /health - Health check for Render"""
-    return web.json_response({
-        "status": "healthy",
-        "timestamp": datetime.now().isoformat()
-    })
+# Admin API Routes
+async def handle_api_admin_users(request):
+    """GET /api/admin/users - Get all users (admin only)"""
+    auth = request.headers.get('Authorization', '')
+    if auth != f"Bearer {API_KEY}":
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    
+    try:
+        c.execute("SELECT id, username, coins, level, role FROM users ORDER BY coins DESC")
+        users = []
+        for user_id, username, coins, level, role in c.fetchall():
+            # Check premium status
+            has_premium = False
+            main_guild = bot.get_guild(MAIN_SERVER_ID)
+            if main_guild:
+                member = main_guild.get_member(user_id)
+                if member:
+                    premium_role = main_guild.get_role(PREMIUM_ROLE_ID)
+                    has_premium = premium_role and premium_role in member.roles
+            
+            users.append({
+                "id": user_id,
+                "username": username or f"User-{user_id}",
+                "coins": coins,
+                "level": level,
+                "premium": has_premium,
+                "role": role
+            })
+        
+        return web.json_response(users)
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+async def handle_api_admin_stats(request):
+    """GET /api/admin/stats - Get system stats (admin only)"""
+    auth = request.headers.get('Authorization', '')
+    if auth != f"Bearer {API_KEY}":
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    
+    try:
+        # Get system stats
+        cpu_percent = psutil.cpu_percent()
+        memory = psutil.virtual_memory()
+        
+        # Get uptime
+        uptime = datetime.now() - bot.start_time
+        hours = uptime.total_seconds() / 3600
+        
+        # Get DB size
+        db_size = os.path.getsize(DATA_DIR / "xult.db") / (1024 * 1024)
+        
+        return web.json_response({
+            "cpu": cpu_percent,
+            "memory": memory.used / (1024 * 1024),
+            "memory_total": memory.total / (1024 * 1024),
+            "uptime": f"{int(hours)}h {int(uptime.seconds % 3600 / 60)}m",
+            "dbSize": round(db_size, 2)
+        })
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+async def handle_api_admin_premium(request):
+    """GET /api/admin/premium - Get premium stats (admin only)"""
+    auth = request.headers.get('Authorization', '')
+    if auth != f"Bearer {API_KEY}":
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    
+    try:
+        c.execute("SELECT COUNT(*) FROM premium_users WHERE is_active = 1")
+        total = c.fetchone()[0] or 0
+        
+        return web.json_response({"total": total})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+async def handle_api_admin_logs_stock(request):
+    """GET /api/admin/logs/stock - Get stock usage logs (admin only)"""
+    auth = request.headers.get('Authorization', '')
+    if auth != f"Bearer {API_KEY}":
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    
+    try:
+        c.execute("SELECT user_id, stock_type, generated_at FROM stock_usage ORDER BY generated_at DESC LIMIT 50")
+        logs = []
+        for user_id, stock_type, generated_at in c.fetchall():
+            time = datetime.fromisoformat(generated_at).strftime("%H:%M:%S")
+            logs.append({
+                "userId": user_id,
+                "type": stock_type,
+                "item": stock_type,
+                "time": time
+            })
+        
+        return web.json_response(logs)
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+# Owner API Routes
+async def handle_api_owner_users(request):
+    """GET /api/owner/users - Get all users with full data (owner only)"""
+    auth = request.headers.get('Authorization', '')
+    if auth != f"Bearer {API_KEY}":
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    
+    try:
+        c.execute("SELECT id, username, coins, xp, level, role FROM users ORDER BY coins DESC")
+        users = []
+        for user_id, username, coins, xp, level, role in c.fetchall():
+            # Determine role
+            user_role = role or "user"
+            if str(user_id) == str(BOT_OWNER_ID):
+                user_role = "owner"
+            else:
+                main_guild = bot.get_guild(MAIN_SERVER_ID)
+                if main_guild:
+                    member = main_guild.get_member(user_id)
+                    if member:
+                        premium_role = main_guild.get_role(PREMIUM_ROLE_ID)
+                        if premium_role and premium_role in member.roles:
+                            user_role = "premium"
+            
+            users.append({
+                "id": user_id,
+                "username": username or f"User-{user_id}",
+                "coins": coins,
+                "xp": xp,
+                "level": level,
+                "role": user_role
+            })
+        
+        return web.json_response(users)
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+async def handle_api_owner_servers(request):
+    """GET /api/owner/servers - Get all servers (owner only)"""
+    auth = request.headers.get('Authorization', '')
+    if auth != f"Bearer {API_KEY}":
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    
+    try:
+        servers = []
+        for guild in bot.guilds:
+            servers.append({
+                "id": guild.id,
+                "name": guild.name,
+                "members": guild.member_count,
+                "owner": str(guild.owner_id)
+            })
+        
+        return web.json_response(servers)
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+async def handle_api_owner_stats(request):
+    """GET /api/owner/stats - Get owner stats"""
+    auth = request.headers.get('Authorization', '')
+    if auth != f"Bearer {API_KEY}":
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    
+    try:
+        c.execute("SELECT COUNT(*) FROM stock_usage WHERE generated_at > datetime('now', '-1 day')")
+        commands_today = c.fetchone()[0] or 0
+        
+        c.execute("SELECT COUNT(*) FROM premium_users WHERE is_active = 1")
+        premium_users = c.fetchone()[0] or 0
+        
+        return web.json_response({
+            "commandsToday": commands_today,
+            "premiumUsers": premium_users
+        })
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+# User roles endpoint for premium check
+async def handle_api_user_roles(request):
+    """GET /api/user/roles/{user_id} - Get user roles"""
+    auth = request.headers.get('Authorization', '')
+    if auth != f"Bearer {API_KEY}":
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    
+    try:
+        user_id = int(request.match_info.get('user_id'))
+        
+        main_guild = bot.get_guild(MAIN_SERVER_ID)
+        if main_guild:
+            member = main_guild.get_member(user_id)
+            if member:
+                roles = [str(r.id) for r in member.roles]
+                return web.json_response({"roles": roles})
+        
+        return web.json_response({"roles": []})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
 
 # ==================== START API SERVER ====================
 
@@ -3017,14 +3841,29 @@ async def start_api_server():
     """Start the aiohttp API server"""
     app = web.Application()
     
+    # Public routes
     app.router.add_get('/health', handle_api_health)
+    
+    # API routes (require API key)
     app.router.add_get('/api/stats', handle_api_stats)
     app.router.add_get('/api/stock', handle_api_stock)
     app.router.add_post('/api/stock/generate/{type}', handle_api_generate)
     app.router.add_post('/api/stock/add', handle_api_stock_add)
     app.router.add_get('/api/check-premium/{user_id}', handle_api_check_premium)
     app.router.add_get('/api/user/{user_id}', handle_api_user)
+    app.router.add_get('/api/user/roles/{user_id}', handle_api_user_roles)
     app.router.add_get('/api/leaderboard', handle_api_leaderboard)
+    
+    # Admin routes
+    app.router.add_get('/api/admin/users', handle_api_admin_users)
+    app.router.add_get('/api/admin/stats', handle_api_admin_stats)
+    app.router.add_get('/api/admin/premium', handle_api_admin_premium)
+    app.router.add_get('/api/admin/logs/stock', handle_api_admin_logs_stock)
+    
+    # Owner routes
+    app.router.add_get('/api/owner/users', handle_api_owner_users)
+    app.router.add_get('/api/owner/servers', handle_api_owner_servers)
+    app.router.add_get('/api/owner/stats', handle_api_owner_stats)
     
     # Find available port
     port = API_PORT
@@ -3055,12 +3894,19 @@ if __name__ == "__main__":
     print("=" * 50)
     print("🚀 Starting XULT - Ultimate Discord Bot")
     print("=" * 50)
-    print("📁 Data directory:", DATA_DIR)
-    print("🤖 Bot token loaded" if TOKEN != "YOUR_BOT_TOKEN_HERE" else "⚠️ Please set your bot token!")
+    print(f"📁 Data directory: {DATA_DIR}")
+    print(f"🔑 API Key: {API_KEY}")
+    print(f"👑 Bot Owner ID: {BOT_OWNER_ID}")
+    print(f"💎 Premium Role ID: {PREMIUM_ROLE_ID}")
+    print(f"🏠 Main Server ID: {MAIN_SERVER_ID}")
     print("=" * 50)
     
-    if TOKEN == "YOUR_BOT_TOKEN_HERE":
-        print("❌ ERROR: Please replace YOUR_BOT_TOKEN_HERE with your actual bot token!")
+    if not TOKEN:
+        print("❌ ERROR: No bot token found! Set DISCORD_BOT_TOKEN environment variable.")
         exit(1)
+    
+    # Save API key for frontend
+    with open(DATA_DIR / "api_key.txt", "w") as f:
+        f.write(API_KEY)
     
     bot.run(TOKEN)
