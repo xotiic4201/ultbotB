@@ -25,17 +25,30 @@ import difflib
 
 # ==================== CONFIGURATION & SETUP ====================
 
-TOKEN = "MTQxNzI4NDc4MDY3NTk1Njc2Ng.GYBuBA.mXppPEwbkJcDiTtMw1aqm1HNjprc3AvRKWQNYk"  # Replace with your actual bot token
+import os
+from dotenv import load_dotenv
 
-# API Keys
-YOUTUBE_API_KEY = "AIzaSyCN3E2clMrtw8Xg3tIL4ZCaSt2FOnNJHrU"
-TWITCH_CLIENT_ID = "nx4vxcvbjhxr804z13lmvguqiwkxbm"
-TWITCH_CLIENT_SECRET = "xe398gjhkg5qle6qcjaywwiwtjrw54"
-TWITTER_BEARER_TOKEN = "AAAAAAAAAAAAAAAAAAAAADyy0gEAAAAA7Cu8kvD1PS9ybclkd%2Fgb1ASn53Y%3D9nNekUZjbAM5NkypzAWA7vqsHAlTIgGe5elnBKWqo1C1rLLxJn"
+# Load environment variables
+load_dotenv()
 
+# Bot Token - MUST be from environment variable
+TOKEN = os.getenv('DISCORD_BOT_TOKEN')
+if not TOKEN:
+    raise ValueError("No Discord bot token found! Set DISCORD_BOT_TOKEN environment variable.")
 
-# Bot Owner ID
-BOT_OWNER_ID = 1302203907782606880
+# API Keys from environment
+YOUTUBE_API_KEY = os.getenv('YOUTUBE_API_KEY', '')
+TWITCH_CLIENT_ID = os.getenv('TWITCH_CLIENT_ID', '')
+TWITCH_CLIENT_SECRET = os.getenv('TWITCH_CLIENT_SECRET', '')
+TWITTER_BEARER_TOKEN = os.getenv('TWITTER_BEARER_TOKEN', '')
+GIPHY_API_KEY = os.getenv('GIPHY_API_KEY', '')
+
+# Bot Owner ID from environment
+BOT_OWNER_ID = int(os.getenv('BOT_OWNER_ID', '1302203907782606880'))
+
+# API Configuration
+API_PORT = int(os.getenv('API_PORT', 5000))
+API_KEY = os.getenv('API_KEY', secrets.token_hex(32))
 
 # Directory setup
 DATA_DIR = Path("data")
