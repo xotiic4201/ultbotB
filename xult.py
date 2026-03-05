@@ -50,19 +50,19 @@ TWITTER_BEARER_TOKEN = os.getenv('TWITTER_BEARER_TOKEN')
 GIPHY_API_KEY = os.getenv('GIPHY_API_KEY', 'dimlVnesALO2DLu14diWdZAAcZIgW1L1')
 
 # Bot Owner ID from environment
-BOT_OWNER_ID = int(os.getenv('BOT_OWNER_ID')
+BOT_OWNER_ID = int(os.getenv('BOT_OWNER_ID'))
 
 # Premium Role ID for vending machine access
-PREMIUM_ROLE_ID = int(os.getenv('PREMIUM_ROLE_ID')
+PREMIUM_ROLE_ID = int(os.getenv('PREMIUM_ROLE_ID'))
 
 # Main Server ID for role checks
-MAIN_SERVER_ID = int(os.getenv('MAIN_SERVER_ID')
+MAIN_SERVER_ID = int(os.getenv('MAIN_SERVER_ID'))
 
 # Log Channel ID for gen usage
-GEN_LOG_CHANNEL_ID = int(os.getenv('GEN_LOG_CHANNEL_ID')
+GEN_LOG_CHANNEL_ID = int(os.getenv('GEN_LOG_CHANNEL_ID'))
 
 # Target Server ID for logs
-TARGET_SERVER_ID = int(os.getenv('TARGET_SERVER_ID')
+TARGET_SERVER_ID = int(os.getenv('TARGET_SERVER_ID'))
 
 # API Configuration
 API_PORT = int(os.getenv('PORT', os.getenv('API_PORT', 10000)))
