@@ -1,9 +1,7 @@
-discord.py==2.3.2
-aiohttp==3.9.1
-python-dotenv==1.0.0
-pytz==2023.3
-lxml==4.9.3
-requests==2.31.0
-Pillow==10.1.0
-matplotlib==3.8.0
-psutil>=5.9.0
+discord.py>=2.3.0
+aiohttp>=3.9.0
+pytz>=2023.3
+xml.etree>=1.3.0
+Pillow>=10.0.0
+requests>=2.31.0
+python-dotenv>=1.0.0
