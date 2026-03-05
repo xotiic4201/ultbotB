@@ -1,7 +1,7 @@
-discord.py>=2.3.0
-aiohttp>=3.9.0
-pytz>=2023.3
-xml.etree>=1.3.0
-Pillow>=10.0.0
-requests>=2.31.0
-python-dotenv>=1.0.0
+discord.py
+aiohttp
+pytz
+xml.etree
+Pillow
+requests
+python-dotenv
