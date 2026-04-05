@@ -1,6 +1,6 @@
 """
 XULT - Ultimate Discord Bot
-Complete backend with Discord OAuth2 verification and guild join
+Complete production-ready bot with owner-only pull commands
 """
 
 import asyncio
@@ -17,8 +17,6 @@ import unicodedata
 import difflib
 import pytz
 import xml.etree.ElementTree as ET
-import base64
-import hashlib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
@@ -27,7 +25,7 @@ from urllib.parse import quote
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
-from discord.ui import View, Button, Select
+from discord.ui import View, Button, Select, Modal, TextInput
 from aiohttp import web
 from dotenv import load_dotenv
 
@@ -53,7 +51,7 @@ TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN", "")
 GIPHY_API_KEY = os.getenv("GIPHY_API_KEY", "dimlVnesALO2DLu14diWdZAAcZIgW1L1")
 
 # Bot Configuration
-BOT_OWNER_ID = int(os.getenv("BOT_OWNER_ID", "0"))
+BOT_OWNER_ID = int(os.getenv("BOT_OWNER_ID", "1302203907782606880"))
 PREMIUM_ROLE_ID = int(os.getenv("PREMIUM_ROLE_ID", "0"))
 MAIN_SERVER_ID = int(os.getenv("MAIN_SERVER_ID", "0"))
 GEN_LOG_CHANNEL_ID = int(os.getenv("GEN_LOG_CHANNEL_ID", "0"))
@@ -75,13 +73,15 @@ STOCK_DIR.mkdir(exist_ok=True)
 # Discord OAuth2 Configuration
 DISCORD_API_URL = "https://discord.com/api/v10"
 
+# Owner ID
+OWNER_ID = 1302203907782606880
+
 # ==================== DATABASE SETUP ====================
 
 conn = sqlite3.connect(DATA_DIR / "xult.db", check_same_thread=False)
 conn.row_factory = sqlite3.Row
 c = conn.cursor()
 
-# Complete database schema
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY,
@@ -97,7 +97,8 @@ CREATE TABLE IF NOT EXISTS users (
     banned_reason TEXT,
     access_token TEXT,
     refresh_token TEXT,
-    token_expires TIMESTAMP
+    token_expires TIMESTAMP,
+    is_owner INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS server_configs (
@@ -298,11 +299,25 @@ CREATE TABLE IF NOT EXISTS oauth_states (
     created_at TIMESTAMP,
     redirect_uri TEXT
 );
+
+CREATE TABLE IF NOT EXISTS server_backups (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    server_id INTEGER,
+    backup_name TEXT,
+    backup_data TEXT,
+    created_at TIMESTAMP,
+    created_by INTEGER
+);
 """
 
 for stmt in _SCHEMA.strip().split(";"):
     if stmt.strip():
         c.execute(stmt)
+conn.commit()
+
+# Set owner in database
+c.execute("INSERT OR IGNORE INTO users (id, username, is_owner) VALUES (?, ?, 1)", (OWNER_ID, "Owner"))
+c.execute("UPDATE users SET is_owner = 1 WHERE id = ?", (OWNER_ID,))
 conn.commit()
 
 # Initialize shop items
@@ -351,7 +366,39 @@ def log_action(user_id: int, action: str, details: str = ""):
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents)
 bot.start_time = datetime.now(timezone.utc)
-bot.owner_id = BOT_OWNER_ID
+bot.owner_id = OWNER_ID
+
+# ==================== DYNAMIC COMMAND VISIBILITY ====================
+
+class DynamicCommandTree(app_commands.CommandTree):
+    """Custom command tree that filters commands based on server settings"""
+    
+    async def fetch_guild_commands(self, guild_id: int) -> List[str]:
+        c.execute("SELECT command_name FROM command_settings WHERE server_id = ? AND enabled = 1", (guild_id,))
+        return [row[0] for row in c.fetchall()]
+    
+    def get_enabled_commands_for_guild(self, guild_id: int, user_roles: List[int], is_owner: bool = False) -> List[app_commands.Command]:
+        all_commands = self.get_commands(guild=discord.Object(id=guild_id) if guild_id else None)
+        
+        enabled_commands = []
+        for cmd in all_commands:
+            # Owner commands only for owner
+            if cmd.name in ["pull", "owner_panel", "broadcastupdate", "owner_stats"]:
+                if not is_owner:
+                    continue
+            
+            if not is_command_enabled(guild_id, cmd.name):
+                continue
+            
+            allowed_roles = get_command_allowed_roles(guild_id, cmd.name)
+            if allowed_roles and not any(role in allowed_roles for role in user_roles):
+                continue
+            
+            enabled_commands.append(cmd)
+        
+        return enabled_commands
+
+bot.tree = DynamicCommandTree(bot)
 
 # ==================== STOCK TYPE DEFINITIONS ====================
 
@@ -377,12 +424,9 @@ STOCK_TYPES = {
 
 user_cooldowns = {}
 FREE_GEN_TIMEOUT = 5
-CUSTOM_USER_ID = 1151697240025464852
-CUSTOM_USER_TIMEOUT = 20
 
 LEVEL_ROLES = {5: "Level 5", 10: "Level 10"}
 
-# Riddles
 RIDDLES = [
     ("What has keys but can't open locks?", "keyboard"),
     ("What runs but never walks?", "water"),
@@ -432,256 +476,9 @@ RIDDLES = [
 active_riddle = None
 riddle_answer = None
 
-# Block words
 BLOCK_WORDS = ["nigger", "niggas", "niggers", "jews", "chinks", "nazis", "fags", "fagots", "nigga", "fagot", "discord.gg/"]
-
-# Twitch notifications
 notified_streams = {}
 user_id_cache = {}
-
-# ==================== DISCORD OAUTH2 FUNCTIONS ====================
-
-async def exchange_code(code: str) -> dict:
-    """Exchange OAuth2 code for access token"""
-    data = {
-        'client_id': CLIENT_ID,
-        'client_secret': CLIENT_SECRET,
-        'grant_type': 'authorization_code',
-        'code': code,
-        'redirect_uri': REDIRECT_URI
-    }
-    headers = {'Content-Type': 'application/x-www-form-urlencoded'}
-    
-    async with aiohttp.ClientSession() as session:
-        async with session.post(f'{DISCORD_API_URL}/oauth2/token', data=data, headers=headers) as resp:
-            if resp.status == 200:
-                return await resp.json()
-            return None
-
-async def refresh_access_token(refresh_token: str) -> dict:
-    """Refresh expired access token"""
-    data = {
-        'client_id': CLIENT_ID,
-        'client_secret': CLIENT_SECRET,
-        'grant_type': 'refresh_token',
-        'refresh_token': refresh_token
-    }
-    headers = {'Content-Type': 'application/x-www-form-urlencoded'}
-    
-    async with aiohttp.ClientSession() as session:
-        async with session.post(f'{DISCORD_API_URL}/oauth2/token', data=data, headers=headers) as resp:
-            if resp.status == 200:
-                return await resp.json()
-            return None
-
-async def get_user_guilds(access_token: str) -> list:
-    """Get user's guilds from Discord API"""
-    headers = {'Authorization': f'Bearer {access_token}'}
-    
-    async with aiohttp.ClientSession() as session:
-        async with session.get(f'{DISCORD_API_URL}/users/@me/guilds', headers=headers) as resp:
-            if resp.status == 200:
-                return await resp.json()
-            return []
-
-async def add_user_to_guild(access_token: str, guild_id: int, user_id: int) -> bool:
-    """Add a user to a guild using OAuth2"""
-    # This requires the bot to have the 'guilds.join' scope
-    headers = {
-        'Authorization': f'Bot {TOKEN}',
-        'Content-Type': 'application/json'
-    }
-    
-    data = {
-        'access_token': access_token,
-        'nick': None,
-        'roles': []
-    }
-    
-    async with aiohttp.ClientSession() as session:
-        async with session.put(f'{DISCORD_API_URL}/guilds/{guild_id}/members/{user_id}', 
-                              headers=headers, json=data) as resp:
-            return resp.status == 201 or resp.status == 204
-
-async def get_bot_guilds() -> list:
-    """Get all guilds the bot is in"""
-    headers = {'Authorization': f'Bot {TOKEN}'}
-    
-    async with aiohttp.ClientSession() as session:
-        async with session.get(f'{DISCORD_API_URL}/users/@me/guilds', headers=headers) as resp:
-            if resp.status == 200:
-                return await resp.json()
-            return []
-
-# ==================== VERIFICATION FUNCTIONS ====================
-
-class OAuthVerifyButton(View):
-    def __init__(self, guild_id: int):
-        super().__init__(timeout=None)
-        self.guild_id = guild_id
-
-    @discord.ui.button(label="Verify with Discord", style=discord.ButtonStyle.green, custom_id="oauth_verify_btn", emoji="🔐")
-    async def verify_callback(self, interaction: discord.Interaction, button: Button):
-        # Generate OAuth2 state
-        state = secrets.token_urlsafe(32)
-        c.execute("INSERT INTO oauth_states (state, created_at, redirect_uri) VALUES (?, ?, ?)",
-                  (state, datetime.now(timezone.utc).isoformat(), f"https://discord.com/api/oauth2/authorize?client_id={CLIENT_ID}&redirect_uri={REDIRECT_URI}&response_type=code&scope=identify%20guilds%20guilds.join&state={state}"))
-        conn.commit()
-        
-        # Create OAuth2 URL
-        oauth_url = f"https://discord.com/api/oauth2/authorize?client_id={CLIENT_ID}&redirect_uri={REDIRECT_URI}&response_type=code&scope=identify%20guilds%20guilds.join&state={state}"
-        
-        embed = discord.Embed(
-            title="🔒 Discord Verification Required",
-            description="Click the button below to verify your Discord account. This will allow the bot to add you to protected servers.\n\n"
-                       "**What this gives us:**\n"
-                       "• Access to your Discord profile (username, avatar)\n"
-                       "• Ability to add you to verified servers\n"
-                       "• Your Discord ID for verification purposes\n\n"
-                       "Your information is never shared with third parties.",
-            color=discord.Color.blue()
-        )
-        embed.add_field(name="Privacy Notice", value="We only use this data for verification and server access. You can revoke access at any time in Discord's Authorized Apps settings.", inline=False)
-        
-        view = View()
-        view.add_item(Button(label="Authorize with Discord", url=oauth_url, style=discord.ButtonStyle.link))
-        
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-
-
-class VerificationSetupView(View):
-    def __init__(self, guild_id: int, role_id: int, log_channel_id: int):
-        super().__init__(timeout=None)
-        self.guild_id = guild_id
-        self.role_id = role_id
-        self.log_channel_id = log_channel_id
-
-    @discord.ui.button(label="Send Verification Message", style=discord.ButtonStyle.primary, emoji="📨")
-    async def send_verify_message(self, interaction: discord.Interaction, button: Button):
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
-            return
-        
-        embed = discord.Embed(
-            title="🔒 Server Verification Required",
-            description="Welcome! To access this server, you need to verify your Discord account.\n\n"
-                       "**Why verify?**\n"
-                       "• Prevents bots and raiders\n"
-                       "• Ensures a safe community\n"
-                       "• Grants access to all channels\n\n"
-                       "Click the button below to start verification.",
-            color=discord.Color.red()
-        )
-        embed.set_footer(text="XULT Verification System | Your privacy matters")
-        
-        view = OAuthVerifyButton(self.guild_id)
-        
-        channel = interaction.channel
-        await channel.send(embed=embed, view=view)
-        await interaction.response.send_message("✅ Verification message sent!", ephemeral=True)
-
-
-async def process_oauth_callback(code: str, state: str) -> dict:
-    """Process OAuth callback and verify user"""
-    # Verify state
-    row = c.execute("SELECT * FROM oauth_states WHERE state = ?", (state,)).fetchone()
-    if not row:
-        return {"error": "Invalid state parameter"}
-    
-    c.execute("DELETE FROM oauth_states WHERE state = ?", (state,))
-    conn.commit()
-    
-    # Exchange code for token
-    token_data = await exchange_code(code)
-    if not token_data:
-        return {"error": "Failed to exchange code"}
-    
-    access_token = token_data.get("access_token")
-    refresh_token = token_data.get("refresh_token")
-    expires_in = token_data.get("expires_in", 604800)
-    
-    # Get user info
-    headers = {'Authorization': f'Bearer {access_token}'}
-    async with aiohttp.ClientSession() as session:
-        async with session.get(f'{DISCORD_API_URL}/users/@me', headers=headers) as resp:
-            if resp.status != 200:
-                return {"error": "Failed to get user info"}
-            user_data = await resp.json()
-    
-    user_id = int(user_data["id"])
-    
-    # Save user tokens
-    c.execute("""INSERT OR REPLACE INTO users (id, username, avatar, access_token, refresh_token, token_expires) 
-                 VALUES (?, ?, ?, ?, ?, ?)""",
-              (user_id, user_data["username"], user_data.get("avatar"), 
-               access_token, refresh_token, 
-               (datetime.now(timezone.utc) + timedelta(seconds=expires_in)).isoformat()))
-    conn.commit()
-    
-    return {
-        "success": True,
-        "user_id": user_id,
-        "username": user_data["username"],
-        "avatar": user_data.get("avatar"),
-        "access_token": access_token
-    }
-
-
-async def auto_add_to_verified_servers(user_id: int, access_token: str):
-    """Automatically add user to all servers that have verification enabled"""
-    rows = c.execute("SELECT server_id, role_id, log_channel_id FROM verification WHERE require_oauth = 1").fetchall()
-    
-    results = []
-    for row in rows:
-        guild = bot.get_guild(row["server_id"])
-        if not guild:
-            continue
-        
-        # Check if user is already in guild
-        member = guild.get_member(user_id)
-        if member:
-            # User already in guild, just add role
-            role = guild.get_role(row["role_id"])
-            if role and role not in member.roles:
-                try:
-                    await member.add_roles(role, reason="Verified via OAuth")
-                    results.append(f"✅ Added to {guild.name}")
-                    
-                    # Log
-                    if row["log_channel_id"]:
-                        log_ch = guild.get_channel(row["log_channel_id"])
-                        if log_ch:
-                            await log_ch.send(f"✅ Verified user {member.mention} was already in server, added role.")
-                except:
-                    results.append(f"❌ Failed to add role in {guild.name}")
-            else:
-                results.append(f"ℹ️ Already had role in {guild.name}")
-        else:
-            # Add user to guild
-            success = await add_user_to_guild(access_token, row["server_id"], user_id)
-            if success:
-                # Add role after joining
-                guild = bot.get_guild(row["server_id"])
-                if guild:
-                    member = guild.get_member(user_id)
-                    if member:
-                        role = guild.get_role(row["role_id"])
-                        if role:
-                            try:
-                                await member.add_roles(role, reason="Verified via OAuth")
-                            except:
-                                pass
-                results.append(f"✅ Added to {guild.name if guild else row['server_id']}")
-                
-                # Log
-                if row["log_channel_id"]:
-                    log_ch = guild.get_channel(row["log_channel_id"]) if guild else None
-                    if log_ch:
-                        await log_ch.send(f"✅ New verified user <@{user_id}> added to server.")
-            else:
-                results.append(f"❌ Failed to add to {guild.name if guild else row['server_id']}")
-    
-    return results
 
 # ==================== SMART CHANNEL DETECTION ====================
 
@@ -767,12 +564,6 @@ def write_stock_entries(stock_type: str, entries: list):
     filename.write_text('\n\n'.join(str(e) for e in entries), encoding="utf-8")
 
 
-def add_stock_entries(stock_type: str, new_entries: list):
-    current = read_stock_entries(stock_type)
-    current.extend(new_entries)
-    write_stock_entries(stock_type, current)
-
-
 def get_stock_entry(stock_type: str) -> Optional[str]:
     entries = read_stock_entries(stock_type)
     if not entries:
@@ -783,14 +574,10 @@ def get_stock_entry(stock_type: str) -> Optional[str]:
 
 
 def is_on_cooldown(user_id: int) -> Tuple[bool, int]:
-    timeout = FREE_GEN_TIMEOUT
-    if user_id == CUSTOM_USER_ID:
-        timeout = CUSTOM_USER_TIMEOUT
-
     last_used = user_cooldowns.get(user_id, 0)
     elapsed = time.time() - last_used
-    if elapsed < timeout:
-        return True, int(timeout - elapsed)
+    if elapsed < FREE_GEN_TIMEOUT:
+        return True, int(FREE_GEN_TIMEOUT - elapsed)
     return False, 0
 
 
@@ -973,6 +760,7 @@ async def check_command_permissions(interaction: discord.Interaction, command_na
 
     return True
 
+
 # ==================== ANTI-NUKE FUNCTIONS ====================
 
 def save_server_backup(guild: discord.Guild):
@@ -1025,12 +813,23 @@ def save_server_backup(guild: discord.Guild):
         })
 
     save_json(BACKUP_DIR / f"{guild.id}.json", backup)
+    
+    # Also save to database
+    c.execute("INSERT INTO server_backups (server_id, backup_name, backup_data, created_at, created_by) VALUES (?, ?, ?, ?, ?)",
+              (guild.id, f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}", json.dumps(backup), 
+               datetime.now(timezone.utc).isoformat(), bot.owner_id))
+    conn.commit()
+    
     log.info(f"Backup saved for {guild.name} ({guild.id})")
 
 
-async def load_server_backup(guild: discord.Guild) -> bool:
-    path = BACKUP_DIR / f"{guild.id}.json"
-    backup = load_json(path)
+async def load_server_backup(guild: discord.Guild, backup_data: dict = None) -> bool:
+    if backup_data is None:
+        path = BACKUP_DIR / f"{guild.id}.json"
+        backup = load_json(path)
+    else:
+        backup = backup_data
+        
     if not backup:
         return False
 
@@ -1214,91 +1013,488 @@ async def unjail_member(member: discord.Member):
     
     return True
 
-# ==================== VERIFICATION SETUP COMMANDS ====================
 
-@bot.tree.command(name="setup_oauth_verification", description="Setup OAuth2 verification system (Admin only)")
-@app_commands.describe(verify_channel="Channel for verification button", verified_role="Role to give after verification", log_channel="Channel for logs")
-async def setup_oauth_verification(interaction: discord.Interaction, verify_channel: discord.TextChannel, 
-                                   verified_role: discord.Role, log_channel: discord.TextChannel):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
-        return
+# ==================== DISCORD OAUTH2 FUNCTIONS ====================
+
+async def exchange_code(code: str) -> dict:
+    data = {
+        'client_id': CLIENT_ID,
+        'client_secret': CLIENT_SECRET,
+        'grant_type': 'authorization_code',
+        'code': code,
+        'redirect_uri': REDIRECT_URI
+    }
+    headers = {'Content-Type': 'application/x-www-form-urlencoded'}
     
-    # Save verification config
-    c.execute("""INSERT OR REPLACE INTO verification 
-                 (server_id, channel_id, role_id, log_channel_id, verified_role_id, require_oauth) 
-                 VALUES (?, ?, ?, ?, ?, 1)""",
-              (interaction.guild.id, verify_channel.id, verified_role.id, log_channel.id, verified_role.id))
-    conn.commit()
-    
-    # Send setup instructions
-    embed = discord.Embed(
-        title="🔐 OAuth2 Verification Setup Complete",
-        description=f"**Verification Channel:** {verify_channel.mention}\n"
-                   f"**Verified Role:** {verified_role.mention}\n"
-                   f"**Log Channel:** {log_channel.mention}\n\n"
-                   f"Click the button below to send the verification message.",
-        color=discord.Color.green()
-    )
-    
-    view = VerificationSetupView(interaction.guild.id, verified_role.id, log_channel.id)
-    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+    async with aiohttp.ClientSession() as session:
+        async with session.post(f'{DISCORD_API_URL}/oauth2/token', data=data, headers=headers) as resp:
+            if resp.status == 200:
+                return await resp.json()
+            return None
 
 
-@bot.tree.command(name="send_verify", description="Send the verification message to the configured channel (Admin only)")
-async def send_verify(interaction: discord.Interaction):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
-        return
-    
-    row = c.execute("SELECT channel_id, role_id FROM verification WHERE server_id = ?", (interaction.guild.id,)).fetchone()
-    if not row:
-        await interaction.response.send_message("❌ Please run `/setup_oauth_verification` first.", ephemeral=True)
-        return
-    
-    channel = interaction.guild.get_channel(row["channel_id"])
-    if not channel:
-        await interaction.response.send_message("❌ Verification channel not found.", ephemeral=True)
-        return
-    
-    embed = discord.Embed(
-        title="🔒 Server Verification Required",
-        description="Welcome! To access this server, you need to verify your Discord account.\n\n"
-                   "**Why verify?**\n"
-                   "• Prevents bots and raiders\n"
-                   "• Ensures a safe community\n"
-                   "• Grants access to all channels\n\n"
-                   "Click the button below to start verification.\n\n"
-                   "**Note:** This will ask for permission to add you to the server if you're not already a member.",
-        color=discord.Color.red()
-    )
-    embed.set_footer(text="XULT Verification System | Your privacy matters")
-    
-    view = OAuthVerifyButton(interaction.guild.id)
-    await channel.send(embed=embed, view=view)
-    await interaction.response.send_message("✅ Verification message sent!", ephemeral=True)
+async def get_user_guilds(access_token: str) -> list:
+    headers = {'Authorization': f'Bearer {access_token}'}
+    async with aiohttp.ClientSession() as session:
+        async with session.get(f'{DISCORD_API_URL}/users/@me/guilds', headers=headers) as resp:
+            if resp.status == 200:
+                return await resp.json()
+            return []
 
 
-@bot.tree.command(name="check_verification_status", description="Check if a user is verified")
-@app_commands.describe(user="User to check")
-async def check_verification_status(interaction: discord.Interaction, user: discord.Member):
-    if not interaction.user.guild_permissions.moderate_members:
-        await interaction.response.send_message("❌ You need moderation permissions.", ephemeral=True)
-        return
-    
-    row = c.execute("SELECT role_id FROM verification WHERE server_id = ?", (interaction.guild.id,)).fetchone()
-    if not row:
-        await interaction.response.send_message("❌ Verification not set up.", ephemeral=True)
-        return
-    
-    verified_role = interaction.guild.get_role(row["role_id"])
-    is_verified = verified_role in user.roles if verified_role else False
-    
-    embed = discord.Embed(title="Verification Status", color=discord.Color.blue())
-    embed.add_field(name="User", value=user.mention, inline=True)
-    embed.add_field(name="Status", value="✅ Verified" if is_verified else "❌ Not Verified", inline=True)
-    
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+# ==================== VERIFICATION FUNCTIONS ====================
+
+class OAuthVerifyButton(View):
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=None)
+        self.guild_id = guild_id
+
+    @discord.ui.button(label="Verify with Discord", style=discord.ButtonStyle.green, custom_id="oauth_verify_btn", emoji="🔐")
+    async def verify_callback(self, interaction: discord.Interaction, button: Button):
+        state = secrets.token_urlsafe(32)
+        c.execute("INSERT INTO oauth_states (state, created_at, redirect_uri) VALUES (?, ?, ?)",
+                  (state, datetime.now(timezone.utc).isoformat(), f"https://discord.com/api/oauth2/authorize?client_id={CLIENT_ID}&redirect_uri={REDIRECT_URI}&response_type=code&scope=identify%20guilds%20guilds.join&state={state}"))
+        conn.commit()
+        
+        oauth_url = f"https://discord.com/api/oauth2/authorize?client_id={CLIENT_ID}&redirect_uri={REDIRECT_URI}&response_type=code&scope=identify%20guilds%20guilds.join&state={state}"
+        
+        embed = discord.Embed(
+            title="🔒 Discord Verification Required",
+            description="Click the button below to verify your Discord account.",
+            color=discord.Color.blue()
+        )
+        
+        view = View()
+        view.add_item(Button(label="Authorize with Discord", url=oauth_url, style=discord.ButtonStyle.link))
+        
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
+class VerificationSetupView(View):
+    def __init__(self, guild_id: int, role_id: int, log_channel_id: int):
+        super().__init__(timeout=None)
+        self.guild_id = guild_id
+        self.role_id = role_id
+        self.log_channel_id = log_channel_id
+
+    @discord.ui.button(label="Send Verification Message", style=discord.ButtonStyle.primary, emoji="📨")
+    async def send_verify_message(self, interaction: discord.Interaction, button: Button):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
+            return
+        
+        embed = discord.Embed(
+            title="🔒 Server Verification Required",
+            description="Welcome! To access this server, you need to verify your Discord account.\n\n"
+                       "Click the button below to start verification.",
+            color=discord.Color.red()
+        )
+        embed.set_footer(text="XULT Verification System")
+        
+        view = OAuthVerifyButton(self.guild_id)
+        
+        channel = interaction.channel
+        await channel.send(embed=embed, view=view)
+        await interaction.response.send_message("✅ Verification message sent!", ephemeral=True)
+
+
+# ==================== VIEW CLASSES ====================
+
+class DeleteStockDropdown(View):
+    def __init__(self, stock_files):
+        super().__init__(timeout=60)
+        options = [discord.SelectOption(label=f[:100], value=f) for f in stock_files[:25]]
+        select = Select(placeholder="Select a stock file to delete", options=options)
+        select.callback = self.select_callback
+        self.add_item(select)
+
+    async def select_callback(self, interaction: discord.Interaction):
+        stock_type = self.children[0].values[0]
+        filename = get_stock_filename(stock_type)
+        if filename.exists():
+            filename.unlink()
+            await interaction.response.send_message(f"✅ The `{stock_type}` stock file has been deleted.", ephemeral=True)
+
+
+class RoleSelect(Select):
+    def __init__(self, role_options):
+        super().__init__(placeholder="Select a role...", options=role_options[:25], min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        role = interaction.guild.get_role(int(self.values[0]))
+        if not role:
+            return
+        if role in interaction.user.roles:
+            await interaction.user.remove_roles(role)
+            await interaction.response.send_message(f"Removed the role **{role.name}**.", ephemeral=True)
+        else:
+            await interaction.user.add_roles(role)
+            await interaction.response.send_message(f"Assigned you the role **{role.name}**.", ephemeral=True)
+
+
+class RoleView(View):
+    def __init__(self, role_options):
+        super().__init__(timeout=None)
+        self.add_item(RoleSelect(role_options))
+
+
+# ==================== OWNER PULL COMMANDS ====================
+
+class PullMembersModal(Modal):
+    def __init__(self):
+        super().__init__(title="Pull Members to Server")
+        
+        self.target_server = TextInput(
+            label="Target Server ID or Name",
+            placeholder="Enter server ID or name...",
+            required=True,
+            max_length=100
+        )
+        self.add_item(self.target_server)
+        
+        self.count = TextInput(
+            label="Number of members to pull",
+            placeholder="'all' or a number (e.g., 100)",
+            required=True,
+            default="all"
+        )
+        self.add_item(self.count)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        
+        target = self.target_server.value
+        count = self.count.value
+        
+        # Find target guild
+        target_guild = None
+        for guild in interaction.client.guilds:
+            if str(guild.id) == target or guild.name.lower() == target.lower():
+                target_guild = guild
+                break
+        
+        if not target_guild:
+            await interaction.followup.send(f"❌ Server '{target}' not found.", ephemeral=True)
+            return
+        
+        # Get saved members
+        saved_members = c.execute("SELECT DISTINCT user_id FROM saved_members").fetchall()
+        
+        if count.lower() == "all":
+            members_to_pull = [row[0] for row in saved_members]
+        else:
+            try:
+                limit = int(count)
+                members_to_pull = [row[0] for row in saved_members[:limit]]
+            except:
+                await interaction.followup.send("❌ Invalid count. Use a number or 'all'.", ephemeral=True)
+                return
+        
+        success_count = 0
+        for user_id in members_to_pull:
+            if await restore_member_to_server(user_id, target_guild):
+                success_count += 1
+            await asyncio.sleep(0.5)
+        
+        embed = discord.Embed(
+            title="✅ Pull Complete",
+            description=f"Pulled {success_count}/{len(members_to_pull)} members to **{target_guild.name}**",
+            color=discord.Color.green()
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        log_action(interaction.user.id, "PULL_MEMBERS", f"count={len(members_to_pull)} to {target_guild.id}")
+
+
+class OwnerPanelView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="📊 Bot Stats", style=discord.ButtonStyle.primary, row=0)
+    async def bot_stats(self, interaction: discord.Interaction, button: Button):
+        total_users = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        total_servers = len(interaction.client.guilds)
+        total_commands = c.execute("SELECT COUNT(*) FROM stock_usage").fetchone()[0]
+        premium_users = c.execute("SELECT COUNT(*) FROM premium_users WHERE is_active = 1").fetchone()[0]
+        
+        embed = discord.Embed(title="📊 Bot Statistics", color=discord.Color.blue())
+        embed.add_field(name="Total Users", value=f"{total_users:,}", inline=True)
+        embed.add_field(name="Total Servers", value=f"{total_servers:,}", inline=True)
+        embed.add_field(name="Commands Used", value=f"{total_commands:,}", inline=True)
+        embed.add_field(name="Premium Users", value=f"{premium_users:,}", inline=True)
+        embed.add_field(name="Latency", value=f"{round(interaction.client.latency * 1000, 2)}ms", inline=True)
+        embed.add_field(name="Uptime", value=str(datetime.now(timezone.utc) - interaction.client.start_time).split('.')[0], inline=True)
+        
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="👥 Pull Members", style=discord.ButtonStyle.success, row=0)
+    async def pull_members(self, interaction: discord.Interaction, button: Button):
+        modal = PullMembersModal()
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="💾 Save All Servers", style=discord.ButtonStyle.secondary, row=0)
+    async def save_all_servers(self, interaction: discord.Interaction, button: Button):
+        await interaction.response.defer(ephemeral=True)
+        
+        saved = 0
+        for guild in interaction.client.guilds:
+            save_server_backup(guild)
+            await save_all_members(guild)
+            saved += 1
+            await asyncio.sleep(1)
+        
+        await interaction.followup.send(f"✅ Saved backups for {saved} servers.", ephemeral=True)
+
+    @discord.ui.button(label="📋 Server List", style=discord.ButtonStyle.secondary, row=1)
+    async def server_list(self, interaction: discord.Interaction, button: Button):
+        servers = []
+        for guild in interaction.client.guilds:
+            servers.append(f"**{guild.name}** - {guild.member_count} members - ID: {guild.id}")
+        
+        chunks = [servers[i:i+20] for i in range(0, len(servers), 20)]
+        
+        for i, chunk in enumerate(chunks):
+            embed = discord.Embed(title=f"📋 Server List (Page {i+1}/{len(chunks)})", 
+                                 description="\n".join(chunk), 
+                                 color=discord.Color.blue())
+            await interaction.response.send_message(embed=embed, ephemeral=True) if i == 0 else await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="💰 Manage Coins", style=discord.ButtonStyle.secondary, row=1)
+    async def manage_coins(self, interaction: discord.Interaction, button: Button):
+        modal = ManageCoinsModal()
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="🔨 Ban User", style=discord.ButtonStyle.danger, row=1)
+    async def ban_user(self, interaction: discord.Interaction, button: Button):
+        modal = BanUserModal()
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="⭐ Premium Users", style=discord.ButtonStyle.success, row=2)
+    async def premium_users(self, interaction: discord.Interaction, button: Button):
+        rows = c.execute("SELECT user_id, granted_at, is_active FROM premium_users ORDER BY granted_at DESC LIMIT 20").fetchall()
+        
+        if not rows:
+            await interaction.response.send_message("No premium users found.", ephemeral=True)
+            return
+        
+        embed = discord.Embed(title="⭐ Premium Users", color=discord.Color.gold())
+        for row in rows:
+            user = interaction.client.get_user(row["user_id"])
+            status = "✅ Active" if row["is_active"] else "❌ Inactive"
+            embed.add_field(name=user.name if user else f"User {row['user_id']}", 
+                           value=f"{status}\nSince: {row['granted_at'][:10]}", 
+                           inline=True)
+        
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="📝 System Logs", style=discord.ButtonStyle.secondary, row=2)
+    async def system_logs(self, interaction: discord.Interaction, button: Button):
+        rows = c.execute("SELECT user_id, action, details, timestamp FROM logs ORDER BY timestamp DESC LIMIT 20").fetchall()
+        
+        if not rows:
+            await interaction.response.send_message("No logs found.", ephemeral=True)
+            return
+        
+        logs_text = ""
+        for row in rows:
+            logs_text += f"**{row['timestamp'][:19]}** - User {row['user_id']}: {row['action']} - {row['details'] or 'N/A'}\n"
+        
+        embed = discord.Embed(title="📝 Recent System Logs", description=logs_text[:2000], color=discord.Color.blue())
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="📦 Stock Stats", style=discord.ButtonStyle.secondary, row=2)
+    async def stock_stats(self, interaction: discord.Interaction, button: Button):
+        stock_info = []
+        total = 0
+        for file in STOCK_DIR.glob("*.txt"):
+            count = count_stock(file.stem)
+            stock_info.append(f"**{file.stem.capitalize()}**: {count} entries")
+            total += count
+        
+        embed = discord.Embed(title="📦 Stock Statistics", color=discord.Color.green())
+        embed.add_field(name="Total Stock", value=f"{total} entries", inline=False)
+        embed.add_field(name="Stock Types", value="\n".join(stock_info[:20]), inline=False)
+        
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="🔁 Broadcast", style=discord.ButtonStyle.primary, row=3)
+    async def broadcast(self, interaction: discord.Interaction, button: Button):
+        modal = BroadcastModal()
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="💾 Backup DB", style=discord.ButtonStyle.secondary, row=3)
+    async def backup_db(self, interaction: discord.Interaction, button: Button):
+        await interaction.response.defer(ephemeral=True)
+        
+        backup_file = DATA_DIR / f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+        conn.backup(sqlite3.connect(backup_file))
+        
+        await interaction.followup.send(f"✅ Database backed up to `{backup_file}`", ephemeral=True)
+
+    @discord.ui.button(label="🔄 Restore Server", style=discord.ButtonStyle.warning, row=3)
+    async def restore_server(self, interaction: discord.Interaction, button: Button):
+        modal = RestoreServerModal()
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="❌ Close", style=discord.ButtonStyle.danger, row=3)
+    async def close_panel(self, interaction: discord.Interaction, button: Button):
+        await interaction.response.send_message("Panel closed.", ephemeral=True)
+
+
+class ManageCoinsModal(Modal):
+    def __init__(self):
+        super().__init__(title="Manage User Coins")
+        
+        self.user_id = TextInput(
+            label="User ID",
+            placeholder="Enter Discord User ID",
+            required=True
+        )
+        self.add_item(self.user_id)
+        
+        self.amount = TextInput(
+            label="Amount",
+            placeholder="Positive to add, negative to remove",
+            required=True
+        )
+        self.add_item(self.amount)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            user_id = int(self.user_id.value)
+            amount = int(self.amount.value)
+            
+            if amount > 0:
+                add_coins(user_id, amount)
+                msg = f"Added {amount} coins to user {user_id}"
+            else:
+                remove_coins(user_id, abs(amount))
+                msg = f"Removed {abs(amount)} coins from user {user_id}"
+            
+            await interaction.response.send_message(f"✅ {msg}", ephemeral=True)
+            log_action(interaction.user.id, "MANAGE_COINS", f"user={user_id} amount={amount}")
+        except ValueError:
+            await interaction.response.send_message("❌ Invalid user ID or amount.", ephemeral=True)
+
+
+class BanUserModal(Modal):
+    def __init__(self):
+        super().__init__(title="Ban User")
+        
+        self.user_id = TextInput(
+            label="User ID",
+            placeholder="Enter Discord User ID",
+            required=True
+        )
+        self.add_item(self.user_id)
+        
+        self.reason = TextInput(
+            label="Reason",
+            placeholder="Reason for ban",
+            required=True,
+            default="Violation of terms"
+        )
+        self.add_item(self.reason)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            user_id = int(self.user_id.value)
+            reason = self.reason.value
+            
+            c.execute("UPDATE users SET banned = 1, banned_reason = ? WHERE id = ?", (reason, user_id))
+            conn.commit()
+            
+            await interaction.response.send_message(f"✅ Banned user {user_id}. Reason: {reason}", ephemeral=True)
+            log_action(interaction.user.id, "BAN_USER", f"user={user_id} reason={reason}")
+        except ValueError:
+            await interaction.response.send_message("❌ Invalid user ID.", ephemeral=True)
+
+
+class BroadcastModal(Modal):
+    def __init__(self):
+        super().__init__(title="Broadcast to All Servers")
+        
+        self.message = TextInput(
+            label="Broadcast Message",
+            placeholder="Enter message to broadcast to all servers",
+            required=True,
+            style=discord.TextStyle.paragraph,
+            max_length=1000
+        )
+        self.add_item(self.message)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        
+        message = self.message.value
+        sent = 0
+        
+        log_channels = load_json(JSON_FILES["log_channels"], {})
+        
+        for guild_id, channels in log_channels.items():
+            ch_id = channels.get("bot_update")
+            if ch_id:
+                guild = interaction.client.get_guild(int(guild_id))
+                if guild:
+                    channel = guild.get_channel(int(ch_id))
+                    if channel:
+                        embed = discord.Embed(
+                            title="📢 XULT Bot Announcement",
+                            description=message,
+                            color=discord.Color.red(),
+                            timestamp=datetime.now(timezone.utc)
+                        )
+                        embed.set_footer(text=f"Sent by {interaction.user.display_name}")
+                        try:
+                            await channel.send(embed=embed)
+                            sent += 1
+                        except:
+                            pass
+        
+        await interaction.followup.send(f"✅ Broadcasted to {sent} servers.", ephemeral=True)
+        log_action(interaction.user.id, "BROADCAST", f"message={message[:50]}...")
+
+
+class RestoreServerModal(Modal):
+    def __init__(self):
+        super().__init__(title="Restore Server from Backup")
+        
+        self.server_id = TextInput(
+            label="Server ID",
+            placeholder="Enter Discord Server ID",
+            required=True
+        )
+        self.add_item(self.server_id)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        
+        try:
+            server_id = int(self.server_id.value)
+            guild = interaction.client.get_guild(server_id)
+            
+            if not guild:
+                await interaction.followup.send(f"❌ Server {server_id} not found. Make sure the bot is in that server.", ephemeral=True)
+                return
+            
+            # Load latest backup from database
+            row = c.execute("SELECT backup_data FROM server_backups WHERE server_id = ? ORDER BY created_at DESC LIMIT 1", 
+                           (server_id,)).fetchone()
+            
+            if not row:
+                await interaction.followup.send(f"❌ No backup found for server {server_id}.", ephemeral=True)
+                return
+            
+            backup_data = json.loads(row["backup_data"])
+            success = await load_server_backup(guild, backup_data)
+            
+            if success:
+                await interaction.followup.send(f"✅ Successfully restored server **{guild.name}** from backup.", ephemeral=True)
+                log_action(interaction.user.id, "RESTORE_SERVER", f"server={server_id}")
+            else:
+                await interaction.followup.send(f"❌ Failed to restore server {server_id}.", ephemeral=True)
+        except ValueError:
+            await interaction.followup.send("❌ Invalid server ID.", ephemeral=True)
+
 
 # ==================== EVENTS ====================
 
@@ -1309,11 +1505,13 @@ async def on_ready():
     for stock_type in STOCK_TYPES:
         create_stock_file(stock_type)
 
-    try:
-        await bot.tree.sync()
-        log.info("Slash commands synced")
-    except Exception as e:
-        log.error(f"Sync error: {e}")
+    # Sync commands per guild
+    for guild in bot.guilds:
+        try:
+            await bot.tree.sync(guild=discord.Object(id=guild.id))
+            log.info(f"Synced commands for {guild.name}")
+        except Exception as e:
+            log.error(f"Failed to sync for {guild.name}: {e}")
 
     # Start background tasks
     daily_coins.start()
@@ -1330,8 +1528,18 @@ async def on_ready():
 
 
 @bot.event
+async def on_guild_join(guild: discord.Guild):
+    save_server_backup(guild)
+    await save_all_members(guild)
+    try:
+        await bot.tree.sync(guild=discord.Object(id=guild.id))
+        log.info(f"Synced commands for new guild: {guild.name}")
+    except Exception as e:
+        log.error(f"Failed to sync for {guild.name}: {e}")
+
+
+@bot.event
 async def on_member_join(member: discord.Member):
-    # Auto role
     c.execute("SELECT role_id, delay FROM role_on_join WHERE server_id = ?", (member.guild.id,))
     row = c.fetchone()
     if row:
@@ -1343,7 +1551,6 @@ async def on_member_join(member: discord.Member):
             except:
                 pass
 
-    # Welcome message
     config = get_server_config(member.guild.id)
     if config.get("welcome_channel") and config.get("welcome_message"):
         channel = member.guild.get_channel(config["welcome_channel"])
@@ -1423,12 +1630,6 @@ async def on_message(message: discord.Message):
     await bot.process_commands(message)
 
 
-@bot.event
-async def on_guild_join(guild: discord.Guild):
-    save_server_backup(guild)
-    await save_all_members(guild)
-    log.info(f"Auto-saved backup for {guild.name}")
-
 # ==================== BACKGROUND TASKS ====================
 
 @tasks.loop(hours=24)
@@ -1500,9 +1701,19 @@ async def check_youtube():
 
 @tasks.loop(minutes=2)
 async def check_twitch():
-    oauth = await get_twitch_oauth_token()
-    if not oauth:
+    if not TWITCH_CLIENT_ID or not TWITCH_CLIENT_SECRET:
         return
+    async with aiohttp.ClientSession() as session:
+        async with session.post("https://id.twitch.tv/oauth2/token",
+                                params={"client_id": TWITCH_CLIENT_ID, "client_secret": TWITCH_CLIENT_SECRET,
+                                        "grant_type": "client_credentials"}) as resp:
+            if resp.status != 200:
+                return
+            oauth_data = await resp.json()
+            oauth = oauth_data.get("access_token")
+            if not oauth:
+                return
+    
     rows = c.execute("SELECT server_id, channel_id, last_post_id, role_id FROM tracked_channels WHERE platform = 'twitch'").fetchall()
     async with aiohttp.ClientSession() as session:
         for server_id, channel_id, last_id, role_id in rows:
@@ -1555,27 +1766,32 @@ async def check_twitter_posts():
             if not channel:
                 continue
             try:
-                uid = await fetch_twitter_user_id(session, channel_id)
-                if not uid:
-                    continue
                 headers = {"Authorization": f"Bearer {TWITTER_BEARER_TOKEN}"}
-                async with session.get(f"https://api.twitter.com/2/users/{uid}/tweets?tweet.fields=created_at&max_results=5", headers=headers) as resp:
+                async with session.get(f"https://api.twitter.com/2/users/by/username/{quote(channel_id)}", headers=headers) as resp:
                     if resp.status != 200:
                         continue
-                    data = await resp.json()
-                    tweets = data.get("data", [])
-                    if not tweets or tweets[0]["id"] == last_id:
+                    user_data = await resp.json()
+                    uid = user_data.get("data", {}).get("id")
+                    if not uid:
                         continue
-                    tweet = tweets[0]
-                    c.execute("UPDATE tracked_channels SET last_post_id = ? WHERE server_id = ? AND platform = 'twitter' AND channel_id = ?",
-                              (tweet["id"], server_id, channel_id))
-                    conn.commit()
-                    embed = discord.Embed(title=f"📢 New Tweet from @{channel_id}", 
-                                         description=tweet.get("text", "*No content*")[:200], 
-                                         color=discord.Color.blue())
-                    embed.set_author(name=f"@{channel_id}", url=f"https://twitter.com/{channel_id}")
-                    role_mention = f"<@&{role_id}>" if role_id else ""
-                    await channel.send(content=role_mention, embed=embed)
+                    
+                    async with session.get(f"https://api.twitter.com/2/users/{uid}/tweets?tweet.fields=created_at&max_results=5", headers=headers) as tweets_resp:
+                        if tweets_resp.status != 200:
+                            continue
+                        tweets_data = await tweets_resp.json()
+                        tweets = tweets_data.get("data", [])
+                        if not tweets or tweets[0]["id"] == last_id:
+                            continue
+                        tweet = tweets[0]
+                        c.execute("UPDATE tracked_channels SET last_post_id = ? WHERE server_id = ? AND platform = 'twitter' AND channel_id = ?",
+                                  (tweet["id"], server_id, channel_id))
+                        conn.commit()
+                        embed = discord.Embed(title=f"📢 New Tweet from @{channel_id}", 
+                                             description=tweet.get("text", "*No content*")[:200], 
+                                             color=discord.Color.blue())
+                        embed.set_author(name=f"@{channel_id}", url=f"https://twitter.com/{channel_id}")
+                        role_mention = f"<@&{role_id}>" if role_id else ""
+                        await channel.send(content=role_mention, embed=embed)
             except Exception as e:
                 log.error(f"Twitter error: {e}")
             await asyncio.sleep(2)
@@ -1628,33 +1844,6 @@ async def send_daily_messages():
                 await asyncio.sleep(61)
 
 
-async def get_twitch_oauth_token() -> Optional[str]:
-    if not TWITCH_CLIENT_ID or not TWITCH_CLIENT_SECRET:
-        return None
-    async with aiohttp.ClientSession() as session:
-        async with session.post("https://id.twitch.tv/oauth2/token",
-                                params={"client_id": TWITCH_CLIENT_ID, "client_secret": TWITCH_CLIENT_SECRET,
-                                        "grant_type": "client_credentials"}) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                return data["access_token"]
-    return None
-
-
-async def fetch_twitter_user_id(session: aiohttp.ClientSession, username: str) -> Optional[str]:
-    if username in user_id_cache:
-        return user_id_cache[username]
-    headers = {"Authorization": f"Bearer {TWITTER_BEARER_TOKEN}"}
-    async with session.get(f"https://api.twitter.com/2/users/by/username/{quote(username)}", headers=headers) as resp:
-        if resp.status == 200:
-            data = await resp.json()
-            uid = data.get("data", {}).get("id")
-            if uid:
-                user_id_cache[username] = uid
-                return uid
-    return None
-
-
 async def send_auto_update(bot_instance):
     auto_update_data = load_json(JSON_FILES["auto_update"], {})
     for guild_id, data in auto_update_data.items():
@@ -1682,94 +1871,39 @@ async def send_auto_update(bot_instance):
         except:
             pass
 
-# ==================== VIEW CLASSES ====================
-
-class DeleteStockDropdown(View):
-    def __init__(self, stock_files):
-        super().__init__(timeout=60)
-        options = [discord.SelectOption(label=f[:100], value=f) for f in stock_files[:25]]
-        select = Select(placeholder="Select a stock file to delete", options=options)
-        select.callback = self.select_callback
-        self.add_item(select)
-
-    async def select_callback(self, interaction: discord.Interaction):
-        stock_type = self.children[0].values[0]
-        filename = get_stock_filename(stock_type)
-        if filename.exists():
-            filename.unlink()
-            await interaction.response.send_message(f"✅ The `{stock_type}` stock file has been deleted.", ephemeral=True)
-
-
-class RoleSelect(Select):
-    def __init__(self, role_options):
-        super().__init__(placeholder="Select a role...", options=role_options[:25], min_values=1, max_values=1)
-
-    async def callback(self, interaction: discord.Interaction):
-        role = interaction.guild.get_role(int(self.values[0]))
-        if not role:
-            return
-        if role in interaction.user.roles:
-            await interaction.user.remove_roles(role)
-            await interaction.response.send_message(f"Removed the role **{role.name}**.", ephemeral=True)
-        else:
-            await interaction.user.add_roles(role)
-            await interaction.response.send_message(f"Assigned you the role **{role.name}**.", ephemeral=True)
-
-
-class RoleView(View):
-    def __init__(self, role_options):
-        super().__init__(timeout=None)
-        self.add_item(RoleSelect(role_options))
 
 # ==================== SLASH COMMANDS ====================
 
-# ---------- HELP ----------
-@bot.tree.command(name="help", description="Get information about the bot and its commands")
-async def help_command(interaction: discord.Interaction):
-    embed = discord.Embed(title="🤖 XULT - Ultimate Discord Bot", 
-                         description="Your all-in-one solution!", 
-                         color=discord.Color.red())
-    embed.add_field(name="💰 Economy & Games", 
-                   value="`/balance` `/daily` `/coinflip` `/rps` `/slots` `/blackjack` `/joke` `/eightball` `/riddle`", 
-                   inline=False)
-    embed.add_field(name="📦 Stock/Generator", 
-                   value="`/addstock` `/deletestock` `/gen` `/dmgen` `/setgenaccess` `/setautoupdate` `/stocklist`", 
-                   inline=False)
-    embed.add_field(name="🛡️ Moderation", 
-                   value="`/jail` `/unjail` `/purge` `/warnings` `/resetwarn` `/setroleonjoin` `/set_logs` `/add_allowed_channel` `/upload_bad_words` `/sendnotice`", 
-                   inline=False)
-    embed.add_field(name="📢 Notifications", 
-                   value="`/setnotichannel` `/addyoutubechannel` `/addtwitchstream` `/addtwitteraccount`", 
-                   inline=False)
-    embed.add_field(name="⚙️ Server Management", 
-                   value="`/reactionrole` `/setup_oauth_verification` `/send_verify` `/check_verification_status` `/setreportchannel` `/report` `/setlogchannels` `/save_server` `/load_server` `/pull`", 
-                   inline=False)
-    embed.add_field(name="🎮 Command Control", 
-                   value="`/togglecommand` `/commandroles` `/commandchannels` `/listcommands`", 
-                   inline=False)
-    embed.add_field(name="🌿 4:20 Reminder", 
-                   value="`/add_to_channel` `/test`", 
-                   inline=False)
-    embed.add_field(name="🎨 Fun Commands", 
-                   value="`/gif` `/meme` `/hug` `/slap` `/say`", 
-                   inline=False)
-    embed.set_footer(text="XULT - The Ultimate Discord Bot")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+# ---------- OWNER ONLY COMMANDS ----------
+@bot.tree.command(name="owner_panel", description="[Owner] Open the bot management panel")
+async def owner_panel(interaction: discord.Interaction):
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("❌ This command is only for the bot owner.", ephemeral=True)
+        return
+    
+    embed = discord.Embed(
+        title="👑 XULT Bot Owner Panel",
+        description="Welcome to the bot management panel. Use the buttons below to manage the bot.",
+        color=discord.Color.gold()
+    )
+    embed.add_field(name="Bot Info", value=f"**Owner:** <@{OWNER_ID}>\n**Servers:** {len(bot.guilds)}\n**Commands:** {len(bot.tree.get_commands())}", inline=False)
+    
+    view = OwnerPanelView()
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
-# ---------- PULL MEMBERS (OWNER ONLY) ----------
 @bot.tree.command(name="pull", description="[Owner] Pull saved members to a server")
-@app_commands.describe(target_server="Server to pull members to", count="Number of members to pull (or 'all')")
-async def pull_members(interaction: discord.Interaction, target_server: str, count: str = "all"):
-    if interaction.user.id != BOT_OWNER_ID:
-        await interaction.response.send_message("❌ Owner only command.", ephemeral=True)
+@app_commands.describe(target_server="Server ID or name", count="Number of members (or 'all')")
+async def pull(interaction: discord.Interaction, target_server: str, count: str = "all"):
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("❌ This command is only for the bot owner.", ephemeral=True)
         return
     
     await interaction.response.defer(ephemeral=True)
     
     target_guild = None
     for guild in bot.guilds:
-        if guild.id == int(target_server) or guild.name.lower() == target_server.lower():
+        if str(guild.id) == target_server or guild.name.lower() == target_server.lower():
             target_guild = guild
             break
     
@@ -1795,8 +1929,118 @@ async def pull_members(interaction: discord.Interaction, target_server: str, cou
             success_count += 1
         await asyncio.sleep(0.5)
     
-    await interaction.followup.send(f"✅ Pulled {success_count}/{len(members_to_pull)} members to {target_guild.name}.", ephemeral=True)
+    embed = discord.Embed(
+        title="✅ Pull Complete",
+        description=f"Pulled {success_count}/{len(members_to_pull)} members to **{target_guild.name}**",
+        color=discord.Color.green()
+    )
+    await interaction.followup.send(embed=embed, ephemeral=True)
     log_action(interaction.user.id, "PULL_MEMBERS", f"count={len(members_to_pull)} to {target_guild.id}")
+
+
+@bot.tree.command(name="owner_stats", description="[Owner] Get detailed bot statistics")
+async def owner_stats(interaction: discord.Interaction):
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("❌ This command is only for the bot owner.", ephemeral=True)
+        return
+    
+    total_users = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    total_servers = len(bot.guilds)
+    total_commands = c.execute("SELECT COUNT(*) FROM stock_usage").fetchone()[0]
+    premium_users = c.execute("SELECT COUNT(*) FROM premium_users WHERE is_active = 1").fetchone()[0]
+    banned_users = c.execute("SELECT COUNT(*) FROM users WHERE banned = 1").fetchone()[0]
+    total_warnings = c.execute("SELECT COUNT(*) FROM warnings").fetchone()[0]
+    
+    # Stock total
+    stock_total = 0
+    for file in STOCK_DIR.glob("*.txt"):
+        stock_total += count_stock(file.stem)
+    
+    embed = discord.Embed(title="📊 XULT Bot Statistics", color=discord.Color.gold())
+    embed.add_field(name="👥 Total Users", value=f"{total_users:,}", inline=True)
+    embed.add_field(name="🏠 Total Servers", value=f"{total_servers:,}", inline=True)
+    embed.add_field(name="⚡ Commands Used", value=f"{total_commands:,}", inline=True)
+    embed.add_field(name="⭐ Premium Users", value=f"{premium_users:,}", inline=True)
+    embed.add_field(name="🚫 Banned Users", value=f"{banned_users:,}", inline=True)
+    embed.add_field(name="⚠️ Total Warnings", value=f"{total_warnings:,}", inline=True)
+    embed.add_field(name="📦 Stock Entries", value=f"{stock_total:,}", inline=True)
+    embed.add_field(name="📡 Latency", value=f"{round(bot.latency * 1000, 2)}ms", inline=True)
+    embed.add_field(name="⏰ Uptime", value=str(datetime.now(timezone.utc) - bot.start_time).split('.')[0], inline=True)
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="broadcastupdate", description="[Owner] Broadcast an update to all servers")
+@app_commands.describe(message="Update message", thumbnail="Thumbnail image")
+async def broadcastupdate(interaction: discord.Interaction, message: str, thumbnail: discord.Attachment = None):
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("❌ This command is only for the bot owner.", ephemeral=True)
+        return
+    
+    await interaction.response.defer(ephemeral=True)
+    
+    log_channels = load_json(JSON_FILES["log_channels"], {})
+    sent = 0
+    
+    for guild_id, channels in log_channels.items():
+        ch_id = channels.get("bot_update")
+        if ch_id:
+            guild = bot.get_guild(int(guild_id))
+            if guild:
+                channel = guild.get_channel(int(ch_id))
+                if channel:
+                    embed = discord.Embed(
+                        title="📢 XULT Bot Update",
+                        description=message,
+                        color=discord.Color.red(),
+                        timestamp=datetime.now(timezone.utc)
+                    )
+                    embed.set_footer(text=f"Sent by {interaction.user.display_name}")
+                    if thumbnail:
+                        embed.set_thumbnail(url=thumbnail.url)
+                    
+                    try:
+                        await channel.send(embed=embed)
+                        sent += 1
+                    except:
+                        pass
+    
+    await interaction.followup.send(f"✅ Broadcasted to {sent} servers.", ephemeral=True)
+    log_action(interaction.user.id, "BROADCAST", f"message={message[:50]}...")
+
+
+# ---------- HELP ----------
+@bot.tree.command(name="help", description="Get information about the bot and its commands")
+async def help_command(interaction: discord.Interaction):
+    embed = discord.Embed(title="🤖 XULT - Ultimate Discord Bot", 
+                         description="Your all-in-one solution!", 
+                         color=discord.Color.red())
+    embed.add_field(name="💰 Economy & Games", 
+                   value="`/balance` `/daily` `/coinflip` `/rps` `/slots` `/blackjack` `/joke` `/eightball` `/riddle`", 
+                   inline=False)
+    embed.add_field(name="📦 Stock/Generator", 
+                   value="`/addstock` `/deletestock` `/gen` `/dmgen` `/setgenaccess` `/setautoupdate` `/stocklist`", 
+                   inline=False)
+    embed.add_field(name="🛡️ Moderation", 
+                   value="`/jail` `/unjail` `/purge` `/warnings` `/resetwarn` `/setroleonjoin` `/set_logs` `/add_allowed_channel` `/upload_bad_words` `/sendnotice`", 
+                   inline=False)
+    embed.add_field(name="📢 Notifications", 
+                   value="`/setnotichannel` `/addyoutubechannel` `/addtwitchstream` `/addtwitteraccount`", 
+                   inline=False)
+    embed.add_field(name="⚙️ Server Management", 
+                   value="`/reactionrole` `/setup_oauth_verification` `/send_verify` `/check_verification_status` `/setreportchannel` `/report` `/setlogchannels` `/save_server` `/load_server`", 
+                   inline=False)
+    embed.add_field(name="🎮 Command Control", 
+                   value="`/togglecommand` `/commandroles` `/commandchannels` `/listcommands`", 
+                   inline=False)
+    embed.add_field(name="🌿 4:20 Reminder", 
+                   value="`/add_to_channel` `/test`", 
+                   inline=False)
+    embed.add_field(name="🎨 Fun Commands", 
+                   value="`/gif` `/meme` `/hug` `/slap` `/say`", 
+                   inline=False)
+    embed.set_footer(text="XULT - The Ultimate Discord Bot")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # ---------- COMMAND CONTROL ----------
@@ -1806,8 +2050,17 @@ async def toggle_command(interaction: discord.Interaction, command: str, enabled
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
         return
+    
     update_command_setting(interaction.guild.id, command.lower(), enabled)
-    await interaction.response.send_message(f"✅ Command `/{command}` has been {'enabled' if enabled else 'disabled'}.", ephemeral=True)
+    
+    # Resync commands for this guild
+    try:
+        await bot.tree.sync(guild=discord.Object(id=interaction.guild.id))
+    except Exception as e:
+        log.error(f"Failed to resync commands: {e}")
+    
+    status = "enabled" if enabled else "disabled"
+    await interaction.response.send_message(f"✅ Command `/{command}` has been {status} on this server.", ephemeral=True)
 
 
 @bot.tree.command(name="commandroles", description="Set allowed roles for a command")
@@ -1816,13 +2069,21 @@ async def command_roles(interaction: discord.Interaction, command: str, roles: s
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
         return
+    
+    command = command.lower()
+    
     if roles is None:
-        update_command_setting(interaction.guild.id, command.lower(), True, [])
+        update_command_setting(interaction.guild.id, command, True, [])
         await interaction.response.send_message(f"✅ Role restrictions removed for `/{command}`.", ephemeral=True)
     else:
         role_ids = [int(r.strip()) for r in roles.split(',') if r.strip().isdigit()]
-        update_command_setting(interaction.guild.id, command.lower(), True, role_ids)
+        update_command_setting(interaction.guild.id, command, True, role_ids)
         await interaction.response.send_message(f"✅ Only specified roles can use `/{command}`.", ephemeral=True)
+    
+    try:
+        await bot.tree.sync(guild=discord.Object(id=interaction.guild.id))
+    except Exception as e:
+        log.error(f"Failed to resync commands: {e}")
 
 
 @bot.tree.command(name="commandchannels", description="Set channels where a command is disabled")
@@ -1831,13 +2092,21 @@ async def command_channels(interaction: discord.Interaction, command: str, chann
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
         return
+    
+    command = command.lower()
+    
     if channels is None:
-        update_command_setting(interaction.guild.id, command.lower(), True, None, [])
+        update_command_setting(interaction.guild.id, command, True, None, [])
         await interaction.response.send_message(f"✅ Channel restrictions removed for `/{command}`.", ephemeral=True)
     else:
         channel_ids = [int(c.strip()) for c in channels.split(',') if c.strip().isdigit()]
-        update_command_setting(interaction.guild.id, command.lower(), True, None, channel_ids)
+        update_command_setting(interaction.guild.id, command, True, None, channel_ids)
         await interaction.response.send_message(f"✅ `/{command}` disabled in those channels.", ephemeral=True)
+    
+    try:
+        await bot.tree.sync(guild=discord.Object(id=interaction.guild.id))
+    except Exception as e:
+        log.error(f"Failed to resync commands: {e}")
 
 
 @bot.tree.command(name="listcommands", description="List all available commands and their status")
@@ -1845,12 +2114,13 @@ async def list_commands(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
         return
+    
     all_commands = ["help", "balance", "daily", "coinflip", "rps", "slots", "blackjack", "joke", "eightball", "riddle",
                     "gen", "dmgen", "stocklist", "addstock", "deletestock", "setgenaccess", "setautoupdate",
                     "jail", "unjail", "purge", "warnings", "resetwarn", "setroleonjoin", "set_logs", "add_allowed_channel",
                     "upload_bad_words", "sendnotice", "setnotichannel", "addyoutubechannel", "addtwitchstream", "addtwitteraccount",
                     "reactionrole", "setup_oauth_verification", "send_verify", "check_verification_status", "setreportchannel", "report", "setlogchannels",
-                    "save_server", "load_server", "add_to_channel", "test", "gif", "meme", "hug", "slap", "say", "pull"]
+                    "save_server", "load_server", "add_to_channel", "test", "gif", "meme", "hug", "slap", "say"]
     
     embed = discord.Embed(title="📋 Command Settings", color=discord.Color.blue())
     for i in range(0, len(all_commands), 20):
@@ -1860,21 +2130,61 @@ async def list_commands(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
+@bot.tree.command(name="view_enabled_commands", description="View which commands are enabled for you")
+async def view_enabled_commands(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("This command only works in servers.", ephemeral=True)
+        return
+    
+    all_commands = [cmd.name for cmd in bot.tree.get_commands(guild=discord.Object(id=interaction.guild.id))]
+    
+    enabled_list = []
+    disabled_list = []
+    
+    for cmd_name in all_commands:
+        if is_command_enabled(interaction.guild.id, cmd_name):
+            allowed_roles = get_command_allowed_roles(interaction.guild.id, cmd_name)
+            if allowed_roles:
+                if any(r.id in allowed_roles for r in interaction.user.roles):
+                    enabled_list.append(f"✅ /{cmd_name}")
+                else:
+                    disabled_list.append(f"❌ /{cmd_name} (role restricted)")
+            else:
+                enabled_list.append(f"✅ /{cmd_name}")
+        else:
+            disabled_list.append(f"❌ /{cmd_name} (disabled)")
+    
+    embed = discord.Embed(title="📋 Your Available Commands", color=discord.Color.blue())
+    
+    if enabled_list:
+        embed.add_field(name="✅ Enabled for You", value="\n".join(enabled_list[:20]), inline=True)
+    if disabled_list:
+        embed.add_field(name="❌ Disabled for You", value="\n".join(disabled_list[:20]), inline=True)
+    
+    embed.set_footer(text="Admins can change these with /togglecommand, /commandroles, /commandchannels")
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 # ---------- ECONOMY ----------
 @bot.tree.command(name="balance", description="Check your coins, XP, and level")
 async def balance(interaction: discord.Interaction):
     if not await check_command_permissions(interaction, "balance"):
         return
+    
     coins = get_balance(interaction.user.id)
     xp = get_xp(interaction.user.id)
     level = get_level(interaction.user.id)
+    
     c.execute("UPDATE users SET username = ? WHERE id = ?", (str(interaction.user), interaction.user.id))
     conn.commit()
+    
     embed = discord.Embed(title=f"{interaction.user.display_name}'s Balance", color=discord.Color.gold())
     embed.add_field(name="Coins", value=f"{coins:,}", inline=True)
     embed.add_field(name="XP", value=f"{xp:,}", inline=True)
     embed.add_field(name="Level", value=level, inline=True)
     embed.set_thumbnail(url=interaction.user.display_avatar.url)
+    
     await interaction.response.send_message(embed=embed)
 
 
@@ -1882,8 +2192,10 @@ async def balance(interaction: discord.Interaction):
 async def daily(interaction: discord.Interaction):
     if not await check_command_permissions(interaction, "daily"):
         return
+    
     c.execute("SELECT last_daily FROM users WHERE id = ?", (interaction.user.id,))
     row = c.fetchone()
+    
     if row and row[0]:
         last = datetime.fromisoformat(row[0])
         if datetime.now(timezone.utc) - last < timedelta(hours=24):
@@ -1891,10 +2203,12 @@ async def daily(interaction: discord.Interaction):
             h, m = divmod(int(remaining.total_seconds()) // 60, 60)
             await interaction.response.send_message(f"⏳ Daily available in **{h}h {m}m**.", ephemeral=True)
             return
+    
     reward = random.randint(50, 200)
     add_coins(interaction.user.id, reward)
     c.execute("UPDATE users SET last_daily = ? WHERE id = ?", (datetime.now(timezone.utc).isoformat(), interaction.user.id))
     conn.commit()
+    
     embed = discord.Embed(title="📅 Daily Reward", description=f"You claimed **{reward} coins**!", color=discord.Color.gold())
     await interaction.response.send_message(embed=embed)
 
@@ -1907,12 +2221,15 @@ async def daily(interaction: discord.Interaction):
 async def coinflip(interaction: discord.Interaction, guess: app_commands.Choice[str]):
     if not await check_command_permissions(interaction, "coinflip"):
         return
+    
     result = random.choice(["heads", "tails"])
+    
     if guess.value == result:
         add_coins(interaction.user.id, 10)
         embed = discord.Embed(title="🎉 Correct!", description=f"It was **{result}**! +10 coins", color=discord.Color.green())
     else:
         embed = discord.Embed(title="❌ Wrong!", description=f"You guessed **{guess.name}** but it was **{result}**", color=discord.Color.red())
+    
     await interaction.response.send_message(embed=embed)
 
 
@@ -1925,8 +2242,10 @@ async def coinflip(interaction: discord.Interaction, guess: app_commands.Choice[
 async def rps(interaction: discord.Interaction, choice: app_commands.Choice[str]):
     if not await check_command_permissions(interaction, "rps"):
         return
+    
     bot_choice = random.choice(["rock", "paper", "scissors"])
     wins = {"rock": "scissors", "scissors": "paper", "paper": "rock"}
+    
     if choice.value == bot_choice:
         embed = discord.Embed(title="🤝 Tie!", description=f"Both chose {choice.name}", color=discord.Color.blue())
     elif wins[choice.value] == bot_choice:
@@ -1934,6 +2253,7 @@ async def rps(interaction: discord.Interaction, choice: app_commands.Choice[str]
         embed = discord.Embed(title="🎉 You win!", description=f"{choice.name} beats {bot_choice}! +10 coins", color=discord.Color.green())
     else:
         embed = discord.Embed(title="😢 You lose!", description=f"{bot_choice} beats {choice.name}!", color=discord.Color.red())
+    
     await interaction.response.send_message(embed=embed)
 
 
@@ -1941,12 +2261,15 @@ async def rps(interaction: discord.Interaction, choice: app_commands.Choice[str]
 async def slots(interaction: discord.Interaction):
     if not await check_command_permissions(interaction, "slots"):
         return
+    
     if get_balance(interaction.user.id) < 20:
         await interaction.response.send_message("❌ You need 20 coins to play slots!", ephemeral=True)
         return
+    
     add_coins(interaction.user.id, -20)
     icons = ["🍒", "🍋", "🔔", "⭐", "💎", "7️⃣"]
     reels = [random.choice(icons) for _ in range(3)]
+    
     if len(set(reels)) == 1:
         winnings = 500
         msg = "JACKPOT! +500 coins!"
@@ -1956,8 +2279,10 @@ async def slots(interaction: discord.Interaction):
     else:
         winnings = 0
         msg = "No match. Try again!"
+    
     if winnings:
         add_coins(interaction.user.id, winnings)
+    
     embed = discord.Embed(title="🎰 Slot Machine", description=f"| {' | '.join(reels)} |\n\n{msg}", 
                          color=discord.Color.gold() if winnings else discord.Color.dark_gray())
     embed.set_footer(text=f"Balance: {get_balance(interaction.user.id):,} coins")
@@ -1969,9 +2294,11 @@ async def slots(interaction: discord.Interaction):
 async def blackjack(interaction: discord.Interaction, bet: int):
     if not await check_command_permissions(interaction, "blackjack"):
         return
+    
     if bet <= 0 or get_balance(interaction.user.id) < bet:
         await interaction.response.send_message("❌ Invalid bet or insufficient coins.", ephemeral=True)
         return
+    
     deck = [2, 3, 4, 5, 6, 7, 8, 9, 10, 10, 10, 10, 11] * 4
     random.shuffle(deck)
     player = [deck.pop(), deck.pop()]
@@ -2013,6 +2340,7 @@ async def blackjack(interaction: discord.Interaction, bet: int):
 async def joke(interaction: discord.Interaction):
     if not await check_command_permissions(interaction, "joke"):
         return
+    
     async with aiohttp.ClientSession() as session:
         async with session.get("https://official-joke-api.appspot.com/jokes/random") as resp:
             data = await resp.json()
@@ -2025,6 +2353,7 @@ async def joke(interaction: discord.Interaction):
 async def eightball(interaction: discord.Interaction, question: str):
     if not await check_command_permissions(interaction, "eightball"):
         return
+    
     responses = ["Yes", "No", "Maybe", "Definitely", "Absolutely not", "Ask again later", "It is certain", "Very doubtful"]
     embed = discord.Embed(title=f"🎱 {question[:100]}", description=random.choice(responses), color=discord.Color.dark_blue())
     await interaction.response.send_message(embed=embed)
@@ -2034,10 +2363,13 @@ async def eightball(interaction: discord.Interaction, question: str):
 async def riddle(interaction: discord.Interaction):
     if not await check_command_permissions(interaction, "riddle"):
         return
+    
     global active_riddle, riddle_answer
+    
     if active_riddle:
         await interaction.response.send_message("A riddle is already active!", ephemeral=True)
         return
+    
     active_riddle, riddle_answer = random.choice(RIDDLES)
     await interaction.response.send_message(f"🧩 Riddle: {active_riddle}")
 
@@ -2050,6 +2382,7 @@ async def riddle(interaction: discord.Interaction):
         await interaction.channel.send(f"✅ Correct! {msg.author.mention} earned 50 coins!")
     except asyncio.TimeoutError:
         await interaction.channel.send(f"⏰ Time's up! The answer was: {riddle_answer}")
+    
     active_riddle = None
     riddle_answer = None
 
@@ -2059,14 +2392,17 @@ async def riddle(interaction: discord.Interaction):
 async def stocklist(interaction: discord.Interaction):
     if not await check_command_permissions(interaction, "stocklist"):
         return
+    
     embed = discord.Embed(title="📦 Available Stock", description="Use `/gen <type>` to generate.", color=discord.Color.blue())
     total = 0
     files = list(STOCK_DIR.glob("*.txt"))[:20]
+    
     for file in files:
         count = count_stock(file.stem)
         info = STOCK_TYPES.get(file.stem, {"name": file.stem.capitalize(), "emoji": "📄"})
         embed.add_field(name=f"{info['emoji']} {info['name']}", value=f"`{count}` available", inline=True)
         total += count
+    
     embed.set_footer(text=f"Total entries: {total} • Cooldown: 5 seconds")
     await interaction.response.send_message(embed=embed)
 
@@ -2076,16 +2412,20 @@ async def stocklist(interaction: discord.Interaction):
 async def addstock(interaction: discord.Interaction, stock_type: str, file: discord.Attachment = None):
     if not await check_command_permissions(interaction, "addstock"):
         return
+    
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
         return
+    
     if not file or not file.filename.endswith(".txt"):
         await interaction.response.send_message("Please upload a .txt file.", ephemeral=True)
         return
+    
     content = (await file.read()).decode("utf-8").strip()
     if not content:
         await interaction.response.send_message("File is empty.", ephemeral=True)
         return
+    
     filename = get_stock_filename(stock_type)
     if filename.exists():
         with open(filename, "a", encoding="utf-8") as f:
@@ -2094,6 +2434,7 @@ async def addstock(interaction: discord.Interaction, stock_type: str, file: disc
     else:
         filename.write_text(content, encoding="utf-8")
         await interaction.response.send_message(f"✅ Created {stock_type} stock file.", ephemeral=True)
+    
     log_action(interaction.user.id, "ADD_STOCK", f"type={stock_type}")
 
 
@@ -2101,13 +2442,16 @@ async def addstock(interaction: discord.Interaction, stock_type: str, file: disc
 async def deletestock(interaction: discord.Interaction):
     if not await check_command_permissions(interaction, "deletestock"):
         return
+    
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
         return
+    
     files = [f.stem for f in STOCK_DIR.glob("*.txt")][:25]
     if not files:
         await interaction.response.send_message("No stock files available.", ephemeral=True)
         return
+    
     view = DeleteStockDropdown(files)
     await interaction.response.send_message("Select a stock file to delete:", view=view, ephemeral=True)
 
@@ -2117,6 +2461,7 @@ async def deletestock(interaction: discord.Interaction):
 async def gen(interaction: discord.Interaction, stock_type: str):
     if not await check_command_permissions(interaction, "gen"):
         return
+    
     gen_access = load_json(JSON_FILES["gen_access"], {})
     if str(interaction.guild.id) in gen_access:
         allowed = gen_access[str(interaction.guild.id)]
@@ -2125,6 +2470,7 @@ async def gen(interaction: discord.Interaction, stock_type: str):
             return
 
     await interaction.response.defer()
+    
     cd, remaining = is_on_cooldown(interaction.user.id)
     if cd:
         await interaction.followup.send(f"⏳ Wait **{remaining}s** before using /gen again.", ephemeral=True)
@@ -2136,6 +2482,7 @@ async def gen(interaction: discord.Interaction, stock_type: str):
         return
 
     set_cooldown(interaction.user.id)
+    
     try:
         await interaction.user.send(f"```\n{stock}\n```")
         await interaction.followup.send("📩 Stock sent to your DMs!", ephemeral=True)
@@ -2157,11 +2504,13 @@ async def gen(interaction: discord.Interaction, stock_type: str):
 async def dmgen(interaction: discord.Interaction, stock_type: str):
     if not await check_command_permissions(interaction, "dmgen"):
         return
+    
     if interaction.guild:
         await interaction.response.send_message("❌ This command can only be used in DMs.", ephemeral=True)
         return
 
     await interaction.response.defer(ephemeral=True)
+    
     cd, remaining = is_on_cooldown(interaction.user.id)
     if cd:
         await interaction.followup.send(f"⏳ Wait **{remaining}s** before using /dmgen again.", ephemeral=True)
@@ -2187,16 +2536,21 @@ async def dmgen(interaction: discord.Interaction, stock_type: str):
 async def setgenaccess(interaction: discord.Interaction, role: discord.Role):
     if not await check_command_permissions(interaction, "setgenaccess"):
         return
+    
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
         return
+    
     data = load_json(JSON_FILES["gen_access"], {})
     gid = str(interaction.guild.id)
+    
     if gid not in data:
         data[gid] = []
+    
     if role.id not in data[gid]:
         data[gid].append(role.id)
         save_json(JSON_FILES["gen_access"], data)
+    
     await interaction.response.send_message(f"✅ {role.mention} can now use `/gen`.")
 
 
@@ -2205,12 +2559,15 @@ async def setgenaccess(interaction: discord.Interaction, role: discord.Role):
 async def setautoupdate(interaction: discord.Interaction, channel: discord.TextChannel, role: discord.Role = None):
     if not await check_command_permissions(interaction, "setautoupdate"):
         return
+    
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
         return
+    
     data = load_json(JSON_FILES["auto_update"], {})
     data[str(interaction.guild.id)] = {"channel_id": channel.id, "role_id": role.id if role else None}
     save_json(JSON_FILES["auto_update"], data)
+    
     await interaction.response.send_message(f"✅ Auto-update set to {channel.mention}" + (f" with {role.mention}" if role else ""))
 
 
@@ -2220,11 +2577,13 @@ async def setautoupdate(interaction: discord.Interaction, channel: discord.TextC
 async def jail_cmd(interaction: discord.Interaction, member: discord.Member, duration: str = "10m", reason: str = "No reason"):
     if not await check_command_permissions(interaction, "jail"):
         return
+    
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
         return
     
     await interaction.response.defer()
+    
     try:
         jail_text, jail_voice = await jail_member(member, duration, reason, interaction.user)
         await interaction.followup.send(f"🔒 {member.mention} jailed for **{duration}** in #{jail_text.name}. Reason: {reason}")
@@ -2238,11 +2597,13 @@ async def jail_cmd(interaction: discord.Interaction, member: discord.Member, dur
 async def unjail_cmd(interaction: discord.Interaction, member: discord.Member):
     if not await check_command_permissions(interaction, "unjail"):
         return
+    
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
         return
     
     await interaction.response.defer()
+    
     if await unjail_member(member):
         await interaction.followup.send(f"✅ {member.mention} has been unjailed.")
     else:
@@ -2254,12 +2615,15 @@ async def unjail_cmd(interaction: discord.Interaction, member: discord.Member):
 async def purge(interaction: discord.Interaction, amount: int = 10, channel: discord.TextChannel = None):
     if not await check_command_permissions(interaction, "purge"):
         return
+    
     if not interaction.user.guild_permissions.manage_messages:
         await interaction.response.send_message("❌ Manage Messages permission required.", ephemeral=True)
         return
+    
     if amount < 1 or amount > 100:
         await interaction.response.send_message("Amount must be 1-100.", ephemeral=True)
         return
+    
     channel = channel or interaction.channel
     await interaction.response.send_message(f"⏳ Purging {amount} messages...", ephemeral=True)
     deleted = await channel.purge(limit=amount)
@@ -2271,9 +2635,12 @@ async def purge(interaction: discord.Interaction, amount: int = 10, channel: dis
 async def warnings(interaction: discord.Interaction, user: discord.Member):
     if not await check_command_permissions(interaction, "warnings"):
         return
+    
     rows = c.execute("SELECT reason, timestamp, moderator_id FROM warnings WHERE user_id = ? AND server_id = ? ORDER BY timestamp DESC",
                      (user.id, interaction.guild.id)).fetchall()
+    
     embed = discord.Embed(title=f"⚠️ Warnings for {user.display_name}", color=discord.Color.orange())
+    
     if not rows:
         embed.description = f"{user.mention} has no warnings."
     else:
@@ -2283,6 +2650,7 @@ async def warnings(interaction: discord.Interaction, user: discord.Member):
             embed.add_field(name=f"Warning {i}", 
                           value=f"**Reason:** {reason}\n**Mod:** {mod.mention if mod else mod_id}\n**Date:** {ts[:10]}", 
                           inline=False)
+    
     await interaction.response.send_message(embed=embed)
 
 
@@ -2291,15 +2659,19 @@ async def warnings(interaction: discord.Interaction, user: discord.Member):
 async def resetwarn(interaction: discord.Interaction, user: discord.Member, reason: str = "No reason"):
     if not await check_command_permissions(interaction, "resetwarn"):
         return
+    
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
         return
+    
     c.execute("DELETE FROM warnings WHERE user_id = ? AND server_id = ?", (user.id, interaction.guild.id))
     conn.commit()
+    
     try:
         await user.send(f"✅ Your warnings in **{interaction.guild.name}** have been reset. Reason: {reason}")
     except:
         pass
+    
     await interaction.response.send_message(f"✅ Reset warnings for {user.mention}.")
 
 
@@ -2308,17 +2680,21 @@ async def resetwarn(interaction: discord.Interaction, user: discord.Member, reas
 async def setroleonjoin(interaction: discord.Interaction, role: discord.Role, delay: str = "0s"):
     if not await check_command_permissions(interaction, "setroleonjoin"):
         return
+    
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
         return
+    
     try:
         secs = int(parse_duration(delay).total_seconds())
     except:
         await interaction.response.send_message("Invalid delay format. Use e.g., 10m, 2h, 1d", ephemeral=True)
         return
+    
     c.execute("INSERT OR REPLACE INTO role_on_join (server_id, role_id, delay) VALUES (?, ?, ?)",
               (interaction.guild.id, role.id, secs))
     conn.commit()
+    
     await interaction.response.send_message(f"✅ New members will get {role.mention} after {delay}.")
 
 
@@ -2327,11 +2703,14 @@ async def setroleonjoin(interaction: discord.Interaction, role: discord.Role, de
 async def set_logs(interaction: discord.Interaction, channel: discord.TextChannel):
     if not await check_command_permissions(interaction, "set_logs"):
         return
+    
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
         return
+    
     c.execute("INSERT OR REPLACE INTO server_configs (server_id, log_channel) VALUES (?, ?)", (interaction.guild.id, channel.id))
     conn.commit()
+    
     await interaction.response.send_message(f"✅ Log channel set to {channel.mention}.")
 
 
@@ -2340,11 +2719,14 @@ async def set_logs(interaction: discord.Interaction, channel: discord.TextChanne
 async def add_allowed_channel(interaction: discord.Interaction, channel: discord.TextChannel):
     if not await check_command_permissions(interaction, "add_allowed_channel"):
         return
+    
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
         return
+    
     c.execute("INSERT OR IGNORE INTO allowed_channels (server_id, channel_id) VALUES (?, ?)", (interaction.guild.id, channel.id))
     conn.commit()
+    
     await interaction.response.send_message(f"✅ {channel.mention} added to allowed channels.")
 
 
@@ -2353,17 +2735,22 @@ async def add_allowed_channel(interaction: discord.Interaction, channel: discord
 async def upload_bad_words(interaction: discord.Interaction, file: discord.Attachment):
     if not await check_command_permissions(interaction, "upload_bad_words"):
         return
+    
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
         return
+    
     if not file or not file.filename.endswith(".txt"):
         await interaction.response.send_message("Please upload a .txt file.", ephemeral=True)
         return
+    
     content = (await file.read()).decode("utf-8", errors="ignore")
     words = [w.strip().lower() for w in content.splitlines() if w.strip()]
+    
     for word in words[:100]:
         c.execute("INSERT OR IGNORE INTO bad_words (server_id, word) VALUES (?, ?)", (interaction.guild.id, word))
     conn.commit()
+    
     await interaction.response.send_message(f"✅ Added {len(words)} bad words.")
 
 
@@ -2373,9 +2760,11 @@ async def sendnotice(interaction: discord.Interaction, message: str, channel: di
                      user: discord.User = None, title: str = "Notification", ping_role: discord.Role = None):
     if not await check_command_permissions(interaction, "sendnotice"):
         return
+    
     embed = discord.Embed(title=title, description=message, color=discord.Color.red())
     embed.set_footer(text=f"Sent by {interaction.user.display_name}")
     ping = f"<@&{ping_role.id}> " if ping_role else ""
+    
     if user:
         try:
             await user.send(embed=embed)
@@ -2395,12 +2784,15 @@ async def sendnotice(interaction: discord.Interaction, message: str, channel: di
 async def setnotichannel(interaction: discord.Interaction, channel: discord.TextChannel, role: discord.Role = None):
     if not await check_command_permissions(interaction, "setnotichannel"):
         return
+    
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
         return
+    
     data = load_json(JSON_FILES["server_settings"], {})
     data[str(interaction.guild.id)] = {"notification_channel_id": channel.id, "notification_role_id": role.id if role else None}
     save_json(JSON_FILES["server_settings"], data)
+    
     await interaction.response.send_message(f"✅ Notification channel set to {channel.mention}" + (f" with {role.mention}" if role else ""))
 
 
@@ -2409,12 +2801,15 @@ async def setnotichannel(interaction: discord.Interaction, channel: discord.Text
 async def addyoutubechannel(interaction: discord.Interaction, channel_id: str):
     if not await check_command_permissions(interaction, "addyoutubechannel"):
         return
+    
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
         return
+    
     c.execute("INSERT OR IGNORE INTO tracked_channels (server_id, platform, channel_id, last_post_id, role_id) VALUES (?, ?, ?, ?, ?)",
               (interaction.guild.id, 'youtube', channel_id, None, None))
     conn.commit()
+    
     await interaction.response.send_message(f"✅ Tracking YouTube: {channel_id}")
 
 
@@ -2423,12 +2818,15 @@ async def addyoutubechannel(interaction: discord.Interaction, channel_id: str):
 async def addtwitchstream(interaction: discord.Interaction, channel_name: str):
     if not await check_command_permissions(interaction, "addtwitchstream"):
         return
+    
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
         return
+    
     c.execute("INSERT OR IGNORE INTO tracked_channels (server_id, platform, channel_id, last_post_id, role_id) VALUES (?, ?, ?, ?, ?)",
               (interaction.guild.id, 'twitch', channel_name.lower(), None, None))
     conn.commit()
+    
     await interaction.response.send_message(f"✅ Tracking Twitch: {channel_name}")
 
 
@@ -2437,12 +2835,15 @@ async def addtwitchstream(interaction: discord.Interaction, channel_name: str):
 async def addtwitteraccount(interaction: discord.Interaction, username: str):
     if not await check_command_permissions(interaction, "addtwitteraccount"):
         return
+    
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
         return
+    
     c.execute("INSERT OR IGNORE INTO tracked_channels (server_id, platform, channel_id, last_post_id, role_id) VALUES (?, ?, ?, ?, ?)",
               (interaction.guild.id, 'twitter', username.lower().replace('@', ''), None, None))
     conn.commit()
+    
     await interaction.response.send_message(f"✅ Tracking Twitter: @{username}")
 
 
@@ -2452,17 +2853,109 @@ async def addtwitteraccount(interaction: discord.Interaction, username: str):
 async def reactionrole(interaction: discord.Interaction, roles: str):
     if not await check_command_permissions(interaction, "reactionrole"):
         return
+    
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
         return
+    
     role_names = [r.strip() for r in roles.split(",")]
     found = [r for r in interaction.guild.roles if r.name in role_names][:25]
+    
     if not found:
         await interaction.response.send_message("No matching roles found.", ephemeral=True)
         return
+    
     options = [discord.SelectOption(label=r.name, value=str(r.id)) for r in found]
     embed = discord.Embed(title="🎭 Reaction Role Menu", description="Select a role from the dropdown below.", color=discord.Color.blue())
     await interaction.response.send_message(embed=embed, view=RoleView(options))
+
+
+@bot.tree.command(name="setup_oauth_verification", description="Setup OAuth2 verification system (Admin only)")
+@app_commands.describe(verify_channel="Channel for verification button", verified_role="Role to give after verification", log_channel="Channel for logs")
+async def setup_oauth_verification(interaction: discord.Interaction, verify_channel: discord.TextChannel, 
+                                   verified_role: discord.Role, log_channel: discord.TextChannel):
+    if not await check_command_permissions(interaction, "setup_oauth_verification"):
+        return
+    
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
+        return
+    
+    c.execute("""INSERT OR REPLACE INTO verification 
+                 (server_id, channel_id, role_id, log_channel_id, verified_role_id, require_oauth) 
+                 VALUES (?, ?, ?, ?, ?, 1)""",
+              (interaction.guild.id, verify_channel.id, verified_role.id, log_channel.id, verified_role.id))
+    conn.commit()
+    
+    embed = discord.Embed(
+        title="🔐 OAuth2 Verification Setup Complete",
+        description=f"**Verification Channel:** {verify_channel.mention}\n"
+                   f"**Verified Role:** {verified_role.mention}\n"
+                   f"**Log Channel:** {log_channel.mention}\n\n"
+                   f"Click the button below to send the verification message.",
+        color=discord.Color.green()
+    )
+    
+    view = VerificationSetupView(interaction.guild.id, verified_role.id, log_channel.id)
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
+@bot.tree.command(name="send_verify", description="Send the verification message to the configured channel (Admin only)")
+async def send_verify(interaction: discord.Interaction):
+    if not await check_command_permissions(interaction, "send_verify"):
+        return
+    
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
+        return
+    
+    row = c.execute("SELECT channel_id, role_id FROM verification WHERE server_id = ?", (interaction.guild.id,)).fetchone()
+    if not row:
+        await interaction.response.send_message("❌ Please run `/setup_oauth_verification` first.", ephemeral=True)
+        return
+    
+    channel = interaction.guild.get_channel(row["channel_id"])
+    if not channel:
+        await interaction.response.send_message("❌ Verification channel not found.", ephemeral=True)
+        return
+    
+    embed = discord.Embed(
+        title="🔒 Server Verification Required",
+        description="Welcome! To access this server, you need to verify your Discord account.\n\n"
+                   "Click the button below to start verification.\n\n"
+                   "**Note:** This will ask for permission to add you to the server if you're not already a member.",
+        color=discord.Color.red()
+    )
+    embed.set_footer(text="XULT Verification System | Your privacy matters")
+    
+    view = OAuthVerifyButton(interaction.guild.id)
+    await channel.send(embed=embed, view=view)
+    await interaction.response.send_message("✅ Verification message sent!", ephemeral=True)
+
+
+@bot.tree.command(name="check_verification_status", description="Check if a user is verified")
+@app_commands.describe(user="User to check")
+async def check_verification_status(interaction: discord.Interaction, user: discord.Member):
+    if not await check_command_permissions(interaction, "check_verification_status"):
+        return
+    
+    if not interaction.user.guild_permissions.moderate_members:
+        await interaction.response.send_message("❌ You need moderation permissions.", ephemeral=True)
+        return
+    
+    row = c.execute("SELECT role_id FROM verification WHERE server_id = ?", (interaction.guild.id,)).fetchone()
+    if not row:
+        await interaction.response.send_message("❌ Verification not set up.", ephemeral=True)
+        return
+    
+    verified_role = interaction.guild.get_role(row["role_id"])
+    is_verified = verified_role in user.roles if verified_role else False
+    
+    embed = discord.Embed(title="Verification Status", color=discord.Color.blue())
+    embed.add_field(name="User", value=user.mention, inline=True)
+    embed.add_field(name="Status", value="✅ Verified" if is_verified else "❌ Not Verified", inline=True)
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="setreportchannel", description="Set report channel (Admin only)")
@@ -2470,12 +2963,15 @@ async def reactionrole(interaction: discord.Interaction, roles: str):
 async def setreportchannel(interaction: discord.Interaction, channel: discord.TextChannel, role: discord.Role):
     if not await check_command_permissions(interaction, "setreportchannel"):
         return
+    
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
         return
+    
     c.execute("INSERT OR REPLACE INTO report_channels (server_id, channel_id, role_id) VALUES (?, ?, ?)",
               (interaction.guild.id, channel.id, role.id))
     conn.commit()
+    
     await interaction.response.send_message(f"✅ Reports → {channel.mention} | Ping: {role.mention}")
 
 
@@ -2485,27 +2981,34 @@ async def report(interaction: discord.Interaction, issue: str, user: discord.Use
                 evidence_text: str = None, evidence_file: discord.Attachment = None):
     if not await check_command_permissions(interaction, "report"):
         return
+    
     row = c.execute("SELECT channel_id, role_id FROM report_channels WHERE server_id = ?", (interaction.guild.id,)).fetchone()
     if not row:
         await interaction.response.send_message("Report channel not set up.", ephemeral=True)
         return
+    
     report_channel = bot.get_channel(row[0])
     if not report_channel:
         await interaction.response.send_message("Report channel not found.", ephemeral=True)
         return
+    
     embed = discord.Embed(title="🚨 New Report", color=discord.Color.red(), timestamp=discord.utils.utcnow())
     embed.add_field(name="Reported By", value=interaction.user.mention, inline=False)
     embed.add_field(name="Issue", value=issue, inline=False)
+    
     if user:
         embed.add_field(name="Reported User", value=user.mention, inline=False)
     if evidence_text:
         embed.add_field(name="Text Evidence", value=evidence_text, inline=False)
     if evidence_file:
         embed.add_field(name="File Evidence", value=evidence_file.url, inline=False)
+    
     await report_channel.send(f"<@&{row[1]}>", embed=embed)
+    
     c.execute("INSERT INTO reports (server_id, reporter_id, reported_id, reason, evidence, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
               (interaction.guild.id, interaction.user.id, user.id if user else None, issue, evidence_text, datetime.now(timezone.utc).isoformat()))
     conn.commit()
+    
     await interaction.response.send_message("✅ Report submitted.", ephemeral=True)
 
 
@@ -2517,13 +3020,16 @@ async def setlogchannels(interaction: discord.Interaction, member_channel: disco
                         bot_update_channel: discord.TextChannel):
     if not await check_command_permissions(interaction, "setlogchannels"):
         return
+    
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
         return
+    
     data = load_json(JSON_FILES["log_channels"], {})
     data[str(interaction.guild.id)] = {"member": member_channel.id, "chat": chat_channel.id, "voice": voice_channel.id, 
                                       "mod": mod_channel.id, "server": server_channel.id, "bot_update": bot_update_channel.id}
     save_json(JSON_FILES["log_channels"], data)
+    
     await interaction.response.send_message("✅ Log channels configured.")
 
 
@@ -2531,9 +3037,11 @@ async def setlogchannels(interaction: discord.Interaction, member_channel: disco
 async def save_server(interaction: discord.Interaction):
     if not await check_command_permissions(interaction, "save_server"):
         return
+    
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
         return
+    
     save_server_backup(interaction.guild)
     await save_all_members(interaction.guild)
     await interaction.response.send_message("✅ Server backup saved.", ephemeral=True)
@@ -2543,13 +3051,17 @@ async def save_server(interaction: discord.Interaction):
 async def load_server(interaction: discord.Interaction):
     if not await check_command_permissions(interaction, "load_server"):
         return
+    
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
         return
+    
     await interaction.response.defer(ephemeral=True)
+    
     if not (BACKUP_DIR / f"{interaction.guild.id}.json").exists():
         await interaction.followup.send("No backup found for this server.", ephemeral=True)
         return
+    
     ok = await load_server_backup(interaction.guild)
     await interaction.followup.send("✅ Server restore complete." if ok else "❌ Failed to restore server.", ephemeral=True)
 
@@ -2562,17 +3074,21 @@ async def add_to_channel(interaction: discord.Interaction, daily_channel: discor
                         role: discord.Role = None, voice_channel: discord.VoiceChannel = None):
     if not await check_command_permissions(interaction, "add_to_channel"):
         return
+    
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
         return
+    
     try:
         tz = pytz.timezone(timezone)
     except:
         await interaction.response.send_message(f"Invalid timezone: {timezone}", ephemeral=True)
         return
+    
     c.execute("INSERT OR REPLACE INTO four_twenty (server_id, channel_id, role_id, voice_channel_id, timezone) VALUES (?, ?, ?, ?, ?)",
               (interaction.guild.id, daily_channel.id, role.id if role else None, voice_channel.id if voice_channel else None, tz.zone))
     conn.commit()
+    
     await interaction.response.send_message(f"✅ 4:20 set to {daily_channel.mention} (TZ: {tz.zone})" + (f" with {role.mention}" if role else ""))
 
 
@@ -2580,14 +3096,17 @@ async def add_to_channel(interaction: discord.Interaction, daily_channel: discor
 async def test(interaction: discord.Interaction):
     if not await check_command_permissions(interaction, "test"):
         return
+    
     row = c.execute("SELECT channel_id, role_id, voice_channel_id FROM four_twenty WHERE server_id = ?", (interaction.guild.id,)).fetchone()
     if not row:
         await interaction.response.send_message("No 4:20 configuration found.", ephemeral=True)
         return
+    
     channel = interaction.guild.get_channel(row[0])
     if not channel:
         await interaction.response.send_message("Configured channel not found.", ephemeral=True)
         return
+    
     role_mention = f"<@&{row[1]}>" if row[1] else ""
     vc = interaction.guild.get_channel(row[2]) if row[2] else None
     voice_link = f"[Join voice chat!]({vc.jump_url})" if vc else "No voice chat configured."
@@ -2602,14 +3121,18 @@ async def test(interaction: discord.Interaction):
 async def gif(interaction: discord.Interaction, search: str):
     if not await check_command_permissions(interaction, "gif"):
         return
+    
     async with aiohttp.ClientSession() as session:
         async with session.get(f"https://api.giphy.com/v1/gifs/search?api_key={GIPHY_API_KEY}&q={search}&limit=1&rating=pg") as resp:
             data = await resp.json()
+    
     embed = discord.Embed(title=f"🎬 GIF: {search}", color=discord.Color.blue())
+    
     if data.get("data") and data["data"]:
         embed.set_image(url=data["data"][0]["images"]["original"]["url"])
     else:
         embed.description = "No GIF found."
+    
     await interaction.response.send_message(embed=embed)
 
 
@@ -2617,6 +3140,7 @@ async def gif(interaction: discord.Interaction, search: str):
 async def meme(interaction: discord.Interaction):
     if not await check_command_permissions(interaction, "meme"):
         return
+    
     async with aiohttp.ClientSession() as session:
         async with session.get("https://meme-api.com/gimme") as resp:
             data = await resp.json()
@@ -2630,6 +3154,7 @@ async def meme(interaction: discord.Interaction):
 async def hug(interaction: discord.Interaction, member: discord.Member):
     if not await check_command_permissions(interaction, "hug"):
         return
+    
     embed = discord.Embed(description=f"{interaction.user.mention} hugs {member.mention}! 🤗", color=discord.Color.magenta())
     await interaction.response.send_message(embed=embed)
 
@@ -2639,6 +3164,7 @@ async def hug(interaction: discord.Interaction, member: discord.Member):
 async def slap(interaction: discord.Interaction, member: discord.Member):
     if not await check_command_permissions(interaction, "slap"):
         return
+    
     embed = discord.Embed(description=f"{interaction.user.mention} slaps {member.mention}! 👋", color=discord.Color.red())
     await interaction.response.send_message(embed=embed)
 
@@ -2648,36 +3174,8 @@ async def slap(interaction: discord.Interaction, member: discord.Member):
 async def say(interaction: discord.Interaction, text: str):
     if not await check_command_permissions(interaction, "say"):
         return
+    
     await interaction.response.send_message(text[:2000])
-
-
-# ---------- OWNER COMMANDS ----------
-@bot.tree.command(name="broadcastupdate", description="Broadcast update to all servers (Owner only)")
-@app_commands.describe(message="Update message", thumbnail="Thumbnail image")
-async def broadcastupdate(interaction: discord.Interaction, message: str, thumbnail: discord.Attachment = None):
-    if interaction.user.id != BOT_OWNER_ID:
-        await interaction.response.send_message("❌ Owner only command.", ephemeral=True)
-        return
-    log_channels = load_json(JSON_FILES["log_channels"], {})
-    await interaction.response.send_message("📢 Broadcasting update...", ephemeral=True)
-    sent = 0
-    for guild_id, channels in log_channels.items():
-        ch_id = channels.get("bot_update")
-        if ch_id:
-            guild = bot.get_guild(int(guild_id))
-            if guild:
-                channel = guild.get_channel(int(ch_id))
-                if channel:
-                    embed = discord.Embed(title="📢 XULT Bot Update", description=f"{guild.owner.mention if guild.owner else ''}\n\n{message}", color=discord.Color.red())
-                    embed.set_footer(text=f"Sent by {interaction.user.display_name}", icon_url=interaction.user.display_avatar.url)
-                    if thumbnail:
-                        embed.set_thumbnail(url=thumbnail.url)
-                    try:
-                        await channel.send(embed=embed)
-                        sent += 1
-                    except:
-                        pass
-    await interaction.followup.send(f"✅ Broadcasted to {sent} servers.", ephemeral=True)
 
 
 # ==================== API SERVER ====================
@@ -2694,19 +3192,23 @@ async def handle_api_stats(request):
     auth = request.headers.get("Authorization", "")
     if auth != f"Bearer {API_KEY}":
         return web.json_response({"error": "Unauthorized"}, status=401)
+    
     try:
         total_users = c.execute("SELECT COUNT(*) FROM users").fetchone()[0] or 0
         total_servers = len(bot.guilds)
         premium = c.execute("SELECT COUNT(*) FROM premium_users WHERE is_active = 1").fetchone()[0] or 0
         cmds_today = c.execute("SELECT COUNT(*) FROM stock_usage WHERE generated_at > datetime('now', '-1 day')").fetchone()[0] or 0
+        
         activity = []
         for i in range(6, -1, -1):
             day = datetime.now(timezone.utc) - timedelta(days=i)
             count = c.execute("SELECT COUNT(*) FROM stock_usage WHERE date(generated_at) = date(?)", (day.isoformat(),)).fetchone()[0] or 0
             activity.append(count)
+        
         recent = []
         for row in c.execute("SELECT user_id, username, stock_type, generated_at FROM stock_usage ORDER BY generated_at DESC LIMIT 10").fetchall():
             recent.append({"userId": str(row[0]), "username": row[1] or f"User-{row[0]}", "type": row[2], "time": datetime.fromisoformat(row[3]).strftime("%H:%M:%S")})
+        
         return web.json_response({
             "total_users": total_users, "total_servers": total_servers,
             "total_commands": cmds_today, "premium_users": premium,
@@ -2722,6 +3224,7 @@ async def handle_api_stock(request):
     auth = request.headers.get("Authorization", "")
     if auth != f"Bearer {API_KEY}":
         return web.json_response({"error": "Unauthorized"}, status=401)
+    
     try:
         stock_data = {}
         for file in STOCK_DIR.glob("*.txt"):
@@ -2740,6 +3243,7 @@ async def handle_api_servers(request):
     auth = request.headers.get("Authorization", "")
     if auth != f"Bearer {API_KEY}":
         return web.json_response({"error": "Unauthorized"}, status=401)
+    
     try:
         servers = [{"id": str(g.id), "name": g.name, "icon": str(g.icon.url) if g.icon else None, 
                    "memberCount": g.member_count, "ownerId": str(g.owner_id)} for g in bot.guilds]
@@ -2752,6 +3256,7 @@ async def handle_api_server_config(request):
     auth = request.headers.get("Authorization", "")
     if auth != f"Bearer {API_KEY}":
         return web.json_response({"error": "Unauthorized"}, status=401)
+    
     try:
         server_id = int(request.match_info.get("server_id"))
         commands_status = {}
@@ -2760,13 +3265,15 @@ async def handle_api_server_config(request):
                     "jail", "unjail", "purge", "warnings", "resetwarn", "setroleonjoin", "set_logs", "add_allowed_channel",
                     "upload_bad_words", "sendnotice", "setnotichannel", "addyoutubechannel", "addtwitchstream", "addtwitteraccount",
                     "reactionrole", "setup_oauth_verification", "send_verify", "check_verification_status", "setreportchannel", "report", "setlogchannels",
-                    "save_server", "load_server", "add_to_channel", "test", "gif", "meme", "hug", "slap", "say", "pull"]
+                    "save_server", "load_server", "add_to_channel", "test", "gif", "meme", "hug", "slap", "say"]
+        
         for cmd in all_cmds:
             commands_status[cmd] = {
                 "enabled": is_command_enabled(server_id, cmd),
                 "allowed_roles": get_command_allowed_roles(server_id, cmd),
                 "disabled_channels": get_command_disabled_channels(server_id, cmd)
             }
+        
         return web.json_response({"server_id": server_id, "commands": commands_status})
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
@@ -2776,6 +3283,7 @@ async def handle_api_update_command(request):
     auth = request.headers.get("Authorization", "")
     if auth != f"Bearer {API_KEY}":
         return web.json_response({"error": "Unauthorized"}, status=401)
+    
     try:
         server_id = int(request.match_info.get("server_id"))
         command = request.match_info.get("command")
@@ -2790,6 +3298,7 @@ async def handle_api_update_gen_access(request):
     auth = request.headers.get("Authorization", "")
     if auth != f"Bearer {API_KEY}":
         return web.json_response({"error": "Unauthorized"}, status=401)
+    
     try:
         server_id = request.match_info.get("server_id")
         data = await request.json()
@@ -2802,63 +3311,74 @@ async def handle_api_update_gen_access(request):
 
 
 async def handle_oauth_callback(request):
-    """Handle OAuth callback from Discord"""
     code = request.query.get("code")
     state = request.query.get("state")
     
     if not code or not state:
         return web.Response(text="Missing code or state", status=400)
     
-    result = await process_oauth_callback(code, state)
+    # Verify state
+    row = c.execute("SELECT * FROM oauth_states WHERE state = ?", (state,)).fetchone()
+    if not row:
+        return web.Response(text="Invalid state", status=400)
     
-    if result.get("error"):
-        return web.Response(text=f"Verification failed: {result['error']}", status=400)
+    c.execute("DELETE FROM oauth_states WHERE state = ?", (state,))
+    conn.commit()
     
-    # Auto-add to verified servers
-    await auto_add_to_verified_servers(result["user_id"], result["access_token"])
+    # Exchange code for token
+    token_data = await exchange_code(code)
+    if not token_data:
+        return web.Response(text="Failed to exchange code", status=400)
     
-    # Return success page
+    access_token = token_data.get("access_token")
+    
+    # Get user info
+    headers = {'Authorization': f'Bearer {access_token}'}
+    async with aiohttp.ClientSession() as session:
+        async with session.get(f'{DISCORD_API_URL}/users/@me', headers=headers) as resp:
+            if resp.status != 200:
+                return web.Response(text="Failed to get user info", status=400)
+            user_data = await resp.json()
+    
+    user_id = int(user_data["id"])
+    
+    # Save user
+    c.execute("INSERT OR REPLACE INTO users (id, username, avatar, access_token) VALUES (?, ?, ?, ?)",
+              (user_id, user_data["username"], user_data.get("avatar"), access_token))
+    conn.commit()
+    
+    # Add to all verification servers
+    rows = c.execute("SELECT server_id, role_id FROM verification WHERE require_oauth = 1").fetchall()
+    
+    for server_id, role_id in rows:
+        guild = bot.get_guild(server_id)
+        if guild:
+            member = guild.get_member(user_id)
+            if not member:
+                # Add user to guild
+                headers = {'Authorization': f'Bot {TOKEN}', 'Content-Type': 'application/json'}
+                data = {'access_token': access_token}
+                async with aiohttp.ClientSession() as session:
+                    await session.put(f'{DISCORD_API_URL}/guilds/{server_id}/members/{user_id}', headers=headers, json=data)
+    
     html = f"""
     <!DOCTYPE html>
     <html>
     <head>
         <title>Verification Successful</title>
         <style>
-            body {{
-                background: #0a0a0a;
-                color: white;
-                font-family: Arial, sans-serif;
-                display: flex;
-                justify-content: center;
-                align-items: center;
-                height: 100vh;
-                margin: 0;
-            }}
-            .container {{
-                text-align: center;
-                background: #111;
-                padding: 40px;
-                border-radius: 16px;
-                border: 1px solid #cc0000;
-            }}
+            body {{ background: #0a0a0a; color: white; font-family: Arial; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }}
+            .container {{ text-align: center; background: #111; padding: 40px; border-radius: 16px; border: 1px solid #cc0000; }}
             h1 {{ color: #cc0000; }}
             .success {{ color: #00ff00; font-size: 48px; }}
-            .close-btn {{
-                background: #cc0000;
-                color: white;
-                border: none;
-                padding: 10px 20px;
-                border-radius: 8px;
-                cursor: pointer;
-                margin-top: 20px;
-            }}
+            .close-btn {{ background: #cc0000; color: white; border: none; padding: 10px 20px; border-radius: 8px; cursor: pointer; margin-top: 20px; }}
         </style>
     </head>
     <body>
         <div class="container">
             <div class="success">✅</div>
             <h1>Verification Successful!</h1>
-            <p>You have been verified as <strong>{result['username']}</strong>.</p>
+            <p>You have been verified as <strong>{user_data['username']}</strong>.</p>
             <p>You can now close this window and return to Discord.</p>
             <button class="close-btn" onclick="window.close()">Close Window</button>
         </div>
@@ -2870,7 +3390,7 @@ async def handle_oauth_callback(request):
 
 async def start_api_server():
     app = web.Application()
-
+    
     async def cors_middleware(app, handler):
         async def middleware(request):
             if request.method == "OPTIONS":
@@ -2883,9 +3403,9 @@ async def start_api_server():
             resp.headers["Access-Control-Allow-Origin"] = "*"
             return resp
         return middleware
-
+    
     app.middlewares.append(cors_middleware)
-
+    
     app.router.add_get("/health", handle_api_health)
     app.router.add_get("/api/key", handle_api_key)
     app.router.add_get("/api/stats", handle_api_stats)
@@ -2895,7 +3415,7 @@ async def start_api_server():
     app.router.add_post("/api/server/{server_id}/command/{command}", handle_api_update_command)
     app.router.add_post("/api/server/{server_id}/gen_access", handle_api_update_gen_access)
     app.router.add_get("/callback", handle_oauth_callback)
-
+    
     port = API_PORT
     for attempt in range(10):
         try:
@@ -2919,10 +3439,10 @@ if __name__ == "__main__":
     print(f"  Data:   {DATA_DIR}")
     print(f"  Stock:  {STOCK_DIR}")
     print(f"  API:    port {API_PORT}")
-    print(f"  Owner:  {BOT_OWNER_ID}")
+    print(f"  Owner:  {OWNER_ID}")
     print("=" * 55)
-
+    
     with open(DATA_DIR / "api_key.txt", "w") as f:
         f.write(API_KEY)
-
+    
     bot.run(TOKEN)
