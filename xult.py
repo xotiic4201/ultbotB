@@ -1,6 +1,6 @@
 """
 XULT - Ultimate Discord Bot
-Complete all-in-one bot with dashboard integration - FIXED VERSION
+Complete backend with Discord OAuth2 verification and guild join
 """
 
 import asyncio
@@ -17,6 +17,8 @@ import unicodedata
 import difflib
 import pytz
 import xml.etree.ElementTree as ET
+import base64
+import hashlib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
@@ -39,9 +41,9 @@ TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 if not TOKEN:
     raise ValueError("DISCORD_BOT_TOKEN not set!")
 
-CLIENT_ID = os.getenv("CLIENT_ID", "1417284780675956766")
-CLIENT_SECRET = os.getenv("CLIENT_SECRET")
-REDIRECT_URI = os.getenv("REDIRECT_URI", "https://your-vercel-app.vercel.app/callback")
+CLIENT_ID = os.getenv("CLIENT_ID", "")
+CLIENT_SECRET = os.getenv("CLIENT_SECRET", "")
+REDIRECT_URI = os.getenv("REDIRECT_URI", "https://ultbot-f.vercel.app//callback")
 
 # API Keys
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "")
@@ -70,6 +72,9 @@ BACKUP_DIR.mkdir(exist_ok=True)
 STOCK_DIR = BASE_DIR / "stock"
 STOCK_DIR.mkdir(exist_ok=True)
 
+# Discord OAuth2 Configuration
+DISCORD_API_URL = "https://discord.com/api/v10"
+
 # ==================== DATABASE SETUP ====================
 
 conn = sqlite3.connect(DATA_DIR / "xult.db", check_same_thread=False)
@@ -89,7 +94,10 @@ CREATE TABLE IF NOT EXISTS users (
     role TEXT DEFAULT 'user',
     premium_expires TIMESTAMP,
     banned INTEGER DEFAULT 0,
-    banned_reason TEXT
+    banned_reason TEXT,
+    access_token TEXT,
+    refresh_token TEXT,
+    token_expires TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS server_configs (
@@ -244,7 +252,9 @@ CREATE TABLE IF NOT EXISTS verification (
     channel_id INTEGER,
     role_id INTEGER,
     log_channel_id INTEGER,
-    message_id INTEGER
+    message_id INTEGER,
+    verified_role_id INTEGER,
+    require_oauth INTEGER DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS report_channels (
@@ -281,6 +291,12 @@ CREATE TABLE IF NOT EXISTS saved_members (
     saved_at TIMESTAMP,
     server_id INTEGER,
     PRIMARY KEY (user_id, server_id)
+);
+
+CREATE TABLE IF NOT EXISTS oauth_states (
+    state TEXT PRIMARY KEY,
+    created_at TIMESTAMP,
+    redirect_uri TEXT
 );
 """
 
@@ -422,6 +438,250 @@ BLOCK_WORDS = ["nigger", "niggas", "niggers", "jews", "chinks", "nazis", "fags",
 # Twitch notifications
 notified_streams = {}
 user_id_cache = {}
+
+# ==================== DISCORD OAUTH2 FUNCTIONS ====================
+
+async def exchange_code(code: str) -> dict:
+    """Exchange OAuth2 code for access token"""
+    data = {
+        'client_id': CLIENT_ID,
+        'client_secret': CLIENT_SECRET,
+        'grant_type': 'authorization_code',
+        'code': code,
+        'redirect_uri': REDIRECT_URI
+    }
+    headers = {'Content-Type': 'application/x-www-form-urlencoded'}
+    
+    async with aiohttp.ClientSession() as session:
+        async with session.post(f'{DISCORD_API_URL}/oauth2/token', data=data, headers=headers) as resp:
+            if resp.status == 200:
+                return await resp.json()
+            return None
+
+async def refresh_access_token(refresh_token: str) -> dict:
+    """Refresh expired access token"""
+    data = {
+        'client_id': CLIENT_ID,
+        'client_secret': CLIENT_SECRET,
+        'grant_type': 'refresh_token',
+        'refresh_token': refresh_token
+    }
+    headers = {'Content-Type': 'application/x-www-form-urlencoded'}
+    
+    async with aiohttp.ClientSession() as session:
+        async with session.post(f'{DISCORD_API_URL}/oauth2/token', data=data, headers=headers) as resp:
+            if resp.status == 200:
+                return await resp.json()
+            return None
+
+async def get_user_guilds(access_token: str) -> list:
+    """Get user's guilds from Discord API"""
+    headers = {'Authorization': f'Bearer {access_token}'}
+    
+    async with aiohttp.ClientSession() as session:
+        async with session.get(f'{DISCORD_API_URL}/users/@me/guilds', headers=headers) as resp:
+            if resp.status == 200:
+                return await resp.json()
+            return []
+
+async def add_user_to_guild(access_token: str, guild_id: int, user_id: int) -> bool:
+    """Add a user to a guild using OAuth2"""
+    # This requires the bot to have the 'guilds.join' scope
+    headers = {
+        'Authorization': f'Bot {TOKEN}',
+        'Content-Type': 'application/json'
+    }
+    
+    data = {
+        'access_token': access_token,
+        'nick': None,
+        'roles': []
+    }
+    
+    async with aiohttp.ClientSession() as session:
+        async with session.put(f'{DISCORD_API_URL}/guilds/{guild_id}/members/{user_id}', 
+                              headers=headers, json=data) as resp:
+            return resp.status == 201 or resp.status == 204
+
+async def get_bot_guilds() -> list:
+    """Get all guilds the bot is in"""
+    headers = {'Authorization': f'Bot {TOKEN}'}
+    
+    async with aiohttp.ClientSession() as session:
+        async with session.get(f'{DISCORD_API_URL}/users/@me/guilds', headers=headers) as resp:
+            if resp.status == 200:
+                return await resp.json()
+            return []
+
+# ==================== VERIFICATION FUNCTIONS ====================
+
+class OAuthVerifyButton(View):
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=None)
+        self.guild_id = guild_id
+
+    @discord.ui.button(label="Verify with Discord", style=discord.ButtonStyle.green, custom_id="oauth_verify_btn", emoji="🔐")
+    async def verify_callback(self, interaction: discord.Interaction, button: Button):
+        # Generate OAuth2 state
+        state = secrets.token_urlsafe(32)
+        c.execute("INSERT INTO oauth_states (state, created_at, redirect_uri) VALUES (?, ?, ?)",
+                  (state, datetime.now(timezone.utc).isoformat(), f"https://discord.com/api/oauth2/authorize?client_id={CLIENT_ID}&redirect_uri={REDIRECT_URI}&response_type=code&scope=identify%20guilds%20guilds.join&state={state}"))
+        conn.commit()
+        
+        # Create OAuth2 URL
+        oauth_url = f"https://discord.com/api/oauth2/authorize?client_id={CLIENT_ID}&redirect_uri={REDIRECT_URI}&response_type=code&scope=identify%20guilds%20guilds.join&state={state}"
+        
+        embed = discord.Embed(
+            title="🔒 Discord Verification Required",
+            description="Click the button below to verify your Discord account. This will allow the bot to add you to protected servers.\n\n"
+                       "**What this gives us:**\n"
+                       "• Access to your Discord profile (username, avatar)\n"
+                       "• Ability to add you to verified servers\n"
+                       "• Your Discord ID for verification purposes\n\n"
+                       "Your information is never shared with third parties.",
+            color=discord.Color.blue()
+        )
+        embed.add_field(name="Privacy Notice", value="We only use this data for verification and server access. You can revoke access at any time in Discord's Authorized Apps settings.", inline=False)
+        
+        view = View()
+        view.add_item(Button(label="Authorize with Discord", url=oauth_url, style=discord.ButtonStyle.link))
+        
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
+class VerificationSetupView(View):
+    def __init__(self, guild_id: int, role_id: int, log_channel_id: int):
+        super().__init__(timeout=None)
+        self.guild_id = guild_id
+        self.role_id = role_id
+        self.log_channel_id = log_channel_id
+
+    @discord.ui.button(label="Send Verification Message", style=discord.ButtonStyle.primary, emoji="📨")
+    async def send_verify_message(self, interaction: discord.Interaction, button: Button):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
+            return
+        
+        embed = discord.Embed(
+            title="🔒 Server Verification Required",
+            description="Welcome! To access this server, you need to verify your Discord account.\n\n"
+                       "**Why verify?**\n"
+                       "• Prevents bots and raiders\n"
+                       "• Ensures a safe community\n"
+                       "• Grants access to all channels\n\n"
+                       "Click the button below to start verification.",
+            color=discord.Color.red()
+        )
+        embed.set_footer(text="XULT Verification System | Your privacy matters")
+        
+        view = OAuthVerifyButton(self.guild_id)
+        
+        channel = interaction.channel
+        await channel.send(embed=embed, view=view)
+        await interaction.response.send_message("✅ Verification message sent!", ephemeral=True)
+
+
+async def process_oauth_callback(code: str, state: str) -> dict:
+    """Process OAuth callback and verify user"""
+    # Verify state
+    row = c.execute("SELECT * FROM oauth_states WHERE state = ?", (state,)).fetchone()
+    if not row:
+        return {"error": "Invalid state parameter"}
+    
+    c.execute("DELETE FROM oauth_states WHERE state = ?", (state,))
+    conn.commit()
+    
+    # Exchange code for token
+    token_data = await exchange_code(code)
+    if not token_data:
+        return {"error": "Failed to exchange code"}
+    
+    access_token = token_data.get("access_token")
+    refresh_token = token_data.get("refresh_token")
+    expires_in = token_data.get("expires_in", 604800)
+    
+    # Get user info
+    headers = {'Authorization': f'Bearer {access_token}'}
+    async with aiohttp.ClientSession() as session:
+        async with session.get(f'{DISCORD_API_URL}/users/@me', headers=headers) as resp:
+            if resp.status != 200:
+                return {"error": "Failed to get user info"}
+            user_data = await resp.json()
+    
+    user_id = int(user_data["id"])
+    
+    # Save user tokens
+    c.execute("""INSERT OR REPLACE INTO users (id, username, avatar, access_token, refresh_token, token_expires) 
+                 VALUES (?, ?, ?, ?, ?, ?)""",
+              (user_id, user_data["username"], user_data.get("avatar"), 
+               access_token, refresh_token, 
+               (datetime.now(timezone.utc) + timedelta(seconds=expires_in)).isoformat()))
+    conn.commit()
+    
+    return {
+        "success": True,
+        "user_id": user_id,
+        "username": user_data["username"],
+        "avatar": user_data.get("avatar"),
+        "access_token": access_token
+    }
+
+
+async def auto_add_to_verified_servers(user_id: int, access_token: str):
+    """Automatically add user to all servers that have verification enabled"""
+    rows = c.execute("SELECT server_id, role_id, log_channel_id FROM verification WHERE require_oauth = 1").fetchall()
+    
+    results = []
+    for row in rows:
+        guild = bot.get_guild(row["server_id"])
+        if not guild:
+            continue
+        
+        # Check if user is already in guild
+        member = guild.get_member(user_id)
+        if member:
+            # User already in guild, just add role
+            role = guild.get_role(row["role_id"])
+            if role and role not in member.roles:
+                try:
+                    await member.add_roles(role, reason="Verified via OAuth")
+                    results.append(f"✅ Added to {guild.name}")
+                    
+                    # Log
+                    if row["log_channel_id"]:
+                        log_ch = guild.get_channel(row["log_channel_id"])
+                        if log_ch:
+                            await log_ch.send(f"✅ Verified user {member.mention} was already in server, added role.")
+                except:
+                    results.append(f"❌ Failed to add role in {guild.name}")
+            else:
+                results.append(f"ℹ️ Already had role in {guild.name}")
+        else:
+            # Add user to guild
+            success = await add_user_to_guild(access_token, row["server_id"], user_id)
+            if success:
+                # Add role after joining
+                guild = bot.get_guild(row["server_id"])
+                if guild:
+                    member = guild.get_member(user_id)
+                    if member:
+                        role = guild.get_role(row["role_id"])
+                        if role:
+                            try:
+                                await member.add_roles(role, reason="Verified via OAuth")
+                            except:
+                                pass
+                results.append(f"✅ Added to {guild.name if guild else row['server_id']}")
+                
+                # Log
+                if row["log_channel_id"]:
+                    log_ch = guild.get_channel(row["log_channel_id"]) if guild else None
+                    if log_ch:
+                        await log_ch.send(f"✅ New verified user <@{user_id}> added to server.")
+            else:
+                results.append(f"❌ Failed to add to {guild.name if guild else row['server_id']}")
+    
+    return results
 
 # ==================== SMART CHANNEL DETECTION ====================
 
@@ -716,7 +976,6 @@ async def check_command_permissions(interaction: discord.Interaction, command_na
 # ==================== ANTI-NUKE FUNCTIONS ====================
 
 def save_server_backup(guild: discord.Guild):
-    """Save full server structure backup"""
     backup = {
         "roles": [],
         "categories": [],
@@ -770,7 +1029,6 @@ def save_server_backup(guild: discord.Guild):
 
 
 async def load_server_backup(guild: discord.Guild) -> bool:
-    """Restore server from backup"""
     path = BACKUP_DIR / f"{guild.id}.json"
     backup = load_json(path)
     if not backup:
@@ -846,7 +1104,6 @@ async def load_server_backup(guild: discord.Guild) -> bool:
 
 
 async def save_member_data(member: discord.Member):
-    """Save member data for future restoration"""
     roles = [r.id for r in member.roles if r.name != "@everyone"]
     c.execute("""INSERT OR REPLACE INTO saved_members 
                  (user_id, username, avatar, roles, saved_at, server_id) 
@@ -857,7 +1114,6 @@ async def save_member_data(member: discord.Member):
 
 
 async def restore_member_to_server(member_id: int, target_guild: discord.Guild) -> bool:
-    """Restore a saved member to a server"""
     row = c.execute("SELECT username, avatar, roles FROM saved_members WHERE user_id = ?", (member_id,)).fetchone()
     if not row:
         return False
@@ -872,7 +1128,6 @@ async def restore_member_to_server(member_id: int, target_guild: discord.Guild) 
 
 
 async def save_all_members(guild: discord.Guild):
-    """Save all members from a server"""
     for member in guild.members:
         if not member.bot:
             await save_member_data(member)
@@ -882,8 +1137,6 @@ async def save_all_members(guild: discord.Guild):
 # ==================== JAIL FUNCTIONS ====================
 
 async def setup_jail_channel(guild: discord.Guild) -> Tuple[discord.TextChannel, discord.VoiceChannel]:
-    """Create or get jail channels"""
-    # Text jail channel
     jail_text = discord.utils.get(guild.text_channels, name="jail")
     if not jail_text:
         overwrites = {
@@ -892,7 +1145,6 @@ async def setup_jail_channel(guild: discord.Guild) -> Tuple[discord.TextChannel,
         }
         jail_text = await guild.create_text_channel("jail", overwrites=overwrites, reason="Jail system")
     
-    # Voice jail channel
     jail_voice = discord.utils.get(guild.voice_channels, name="Jail VC")
     if not jail_voice:
         overwrites = {
@@ -905,22 +1157,17 @@ async def setup_jail_channel(guild: discord.Guild) -> Tuple[discord.TextChannel,
 
 
 async def jail_member(member: discord.Member, duration: str, reason: str, moderator: discord.Member):
-    """Jail a member - strips roles and restricts to jail channels"""
     jail_text, jail_voice = await setup_jail_channel(member.guild)
     
-    # Save original roles
     original_roles = [r for r in member.roles if r.name != "@everyone"]
     await member.remove_roles(*original_roles, reason=f"Jailed: {reason}")
     
-    # Set jail channel permissions for the member
     await jail_text.set_permissions(member, read_messages=True, send_messages=True)
     await jail_voice.set_permissions(member, connect=True, speak=True)
     
-    # Move to jail voice if in voice
     if member.voice and member.voice.channel:
         await member.move_to(jail_voice)
     
-    # Save to database
     roles_json = json.dumps([r.id for r in original_roles])
     c.execute("""INSERT OR REPLACE INTO jailed_members 
                  (server_id, user_id, roles, jail_time, duration, reason, jailed_by) 
@@ -939,18 +1186,15 @@ async def jail_member(member: discord.Member, duration: str, reason: str, modera
 
 
 async def unjail_member(member: discord.Member):
-    """Unjail a member - restore roles and permissions"""
     row = c.execute("SELECT roles FROM jailed_members WHERE server_id = ? AND user_id = ?",
                     (member.guild.id, member.id)).fetchone()
     if not row:
         return False
     
-    # Restore roles
     roles = [member.guild.get_role(r) for r in json.loads(row[0]) if member.guild.get_role(r)]
     if roles:
         await member.add_roles(*roles, reason="Unjailed")
     
-    # Remove jail channel permissions
     jail_text = discord.utils.get(member.guild.text_channels, name="jail")
     jail_voice = discord.utils.get(member.guild.voice_channels, name="Jail VC")
     
@@ -959,7 +1203,6 @@ async def unjail_member(member: discord.Member):
     if jail_voice:
         await jail_voice.set_permissions(member, overwrite=None)
     
-    # Remove from database
     c.execute("DELETE FROM jailed_members WHERE server_id = ? AND user_id = ?",
               (member.guild.id, member.id))
     conn.commit()
@@ -971,162 +1214,91 @@ async def unjail_member(member: discord.Member):
     
     return True
 
-# ==================== VERIFICATION FUNCTIONS ====================
+# ==================== VERIFICATION SETUP COMMANDS ====================
 
-async def setup_verification(guild: discord.Guild, verify_channel: discord.TextChannel, 
-                            verified_role: discord.Role, log_channel: discord.TextChannel):
-    """Setup verification system with button"""
-    c.execute("INSERT OR REPLACE INTO verification (server_id, channel_id, role_id, log_channel_id) VALUES (?, ?, ?, ?)",
-              (guild.id, verify_channel.id, verified_role.id, log_channel.id))
+@bot.tree.command(name="setup_oauth_verification", description="Setup OAuth2 verification system (Admin only)")
+@app_commands.describe(verify_channel="Channel for verification button", verified_role="Role to give after verification", log_channel="Channel for logs")
+async def setup_oauth_verification(interaction: discord.Interaction, verify_channel: discord.TextChannel, 
+                                   verified_role: discord.Role, log_channel: discord.TextChannel):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
+        return
+    
+    # Save verification config
+    c.execute("""INSERT OR REPLACE INTO verification 
+                 (server_id, channel_id, role_id, log_channel_id, verified_role_id, require_oauth) 
+                 VALUES (?, ?, ?, ?, ?, 1)""",
+              (interaction.guild.id, verify_channel.id, verified_role.id, log_channel.id, verified_role.id))
     conn.commit()
     
+    # Send setup instructions
     embed = discord.Embed(
-        title="🔒 Verification Required",
-        description="Click the **Verify** button below to verify yourself and gain access to the server.\n\n"
-                   "This helps us keep the server safe from bots and raiders.",
+        title="🔐 OAuth2 Verification Setup Complete",
+        description=f"**Verification Channel:** {verify_channel.mention}\n"
+                   f"**Verified Role:** {verified_role.mention}\n"
+                   f"**Log Channel:** {log_channel.mention}\n\n"
+                   f"Click the button below to send the verification message.",
         color=discord.Color.green()
     )
-    embed.set_footer(text="XULT Verification System")
     
-    view = VerifyButton()
-    await verify_channel.send(embed=embed, view=view)
+    view = VerificationSetupView(interaction.guild.id, verified_role.id, log_channel.id)
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
+@bot.tree.command(name="send_verify", description="Send the verification message to the configured channel (Admin only)")
+async def send_verify(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
+        return
     
-    # Save member data for future restoration
-    for member in guild.members:
-        if not member.bot:
-            await save_member_data(member)
+    row = c.execute("SELECT channel_id, role_id FROM verification WHERE server_id = ?", (interaction.guild.id,)).fetchone()
+    if not row:
+        await interaction.response.send_message("❌ Please run `/setup_oauth_verification` first.", ephemeral=True)
+        return
+    
+    channel = interaction.guild.get_channel(row["channel_id"])
+    if not channel:
+        await interaction.response.send_message("❌ Verification channel not found.", ephemeral=True)
+        return
+    
+    embed = discord.Embed(
+        title="🔒 Server Verification Required",
+        description="Welcome! To access this server, you need to verify your Discord account.\n\n"
+                   "**Why verify?**\n"
+                   "• Prevents bots and raiders\n"
+                   "• Ensures a safe community\n"
+                   "• Grants access to all channels\n\n"
+                   "Click the button below to start verification.\n\n"
+                   "**Note:** This will ask for permission to add you to the server if you're not already a member.",
+        color=discord.Color.red()
+    )
+    embed.set_footer(text="XULT Verification System | Your privacy matters")
+    
+    view = OAuthVerifyButton(interaction.guild.id)
+    await channel.send(embed=embed, view=view)
+    await interaction.response.send_message("✅ Verification message sent!", ephemeral=True)
 
 
-class VerifyButton(View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(label="Verify", style=discord.ButtonStyle.green, custom_id="verify_btn", emoji="✅")
-    async def verify_callback(self, interaction: discord.Interaction, button: Button):
-        row = c.execute("SELECT role_id, log_channel_id FROM verification WHERE server_id = ?", 
-                       (interaction.guild.id,)).fetchone()
-        if not row:
-            await interaction.response.send_message("Verification is not set up.", ephemeral=True)
-            return
-        
-        role = interaction.guild.get_role(row["role_id"])
-        if not role:
-            await interaction.response.send_message("Verified role not found.", ephemeral=True)
-            return
-        
-        if role in interaction.user.roles:
-            await interaction.response.send_message("You are already verified!", ephemeral=True)
-            return
-        
-        await interaction.user.add_roles(role, reason="Verified via button")
-        await interaction.response.send_message(f"✅ You have been verified and assigned the '{role.name}' role!", ephemeral=True)
-        
-        # Save member data
-        await save_member_data(interaction.user)
-        
-        if row["log_channel_id"]:
-            log_ch = interaction.guild.get_channel(row["log_channel_id"])
-            if log_ch:
-                await log_ch.send(f"✅ {interaction.user.mention} has been verified.")
-
-
-# ==================== TWITCH/API FUNCTIONS ====================
-
-async def get_twitch_oauth_token() -> Optional[str]:
-    if not TWITCH_CLIENT_ID or not TWITCH_CLIENT_SECRET:
-        return None
-    async with aiohttp.ClientSession() as session:
-        async with session.post("https://id.twitch.tv/oauth2/token",
-                                params={"client_id": TWITCH_CLIENT_ID, "client_secret": TWITCH_CLIENT_SECRET,
-                                        "grant_type": "client_credentials"}) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                return data["access_token"]
-    return None
-
-
-async def fetch_twitter_user_id(session: aiohttp.ClientSession, username: str) -> Optional[str]:
-    if username in user_id_cache:
-        return user_id_cache[username]
-    headers = {"Authorization": f"Bearer {TWITTER_BEARER_TOKEN}"}
-    async with session.get(f"https://api.twitter.com/2/users/by/username/{quote(username)}", headers=headers) as resp:
-        if resp.status == 200:
-            data = await resp.json()
-            uid = data.get("data", {}).get("id")
-            if uid:
-                user_id_cache[username] = uid
-                return uid
-    return None
-
-# ==================== AUTO-UPDATE FUNCTIONS ====================
-
-async def send_auto_update(bot_instance):
-    auto_update_data = load_json(JSON_FILES["auto_update"], {})
-    for guild_id, data in auto_update_data.items():
-        guild = bot_instance.get_guild(int(guild_id))
-        if not guild:
-            continue
-        channel = bot_instance.get_channel(data.get("channel_id"))
-        if not channel:
-            continue
-        role_mention = f"<@&{data['role_id']}>" if data.get("role_id") else ""
-
-        stock_info = []
-        for file in STOCK_DIR.glob("*.txt"):
-            count = count_stock(file.stem)
-            stock_info.append(f"➜ **{file.stem.capitalize()}**: `{count}` entries")
-            if len(stock_info) >= 20:
-                break
-
-        embed = discord.Embed(title="📦 Stock Update", color=discord.Color.green())
-        embed.add_field(name="Stock", value="\n".join(stock_info) if stock_info else "🚫 No stock available.", inline=False)
-        embed.set_footer(text="Stock updates are live! 🔄")
-
-        try:
-            await channel.send(content=f"📢 {role_mention}, latest stock update!", embed=embed)
-        except:
-            pass
-
-
-# ==================== VIEW CLASSES ====================
-
-class DeleteStockDropdown(View):
-    def __init__(self, stock_files):
-        super().__init__(timeout=60)
-        # Limit to 25 options (Discord limit)
-        options = [discord.SelectOption(label=f[:100], value=f) for f in stock_files[:25]]
-        select = Select(placeholder="Select a stock file to delete", options=options)
-        select.callback = self.select_callback
-        self.add_item(select)
-
-    async def select_callback(self, interaction: discord.Interaction):
-        stock_type = self.children[0].values[0]
-        filename = get_stock_filename(stock_type)
-        if filename.exists():
-            filename.unlink()
-            await interaction.response.send_message(f"✅ The `{stock_type}` stock file has been deleted.", ephemeral=True)
-
-
-class RoleSelect(Select):
-    def __init__(self, role_options):
-        super().__init__(placeholder="Select a role...", options=role_options[:25], min_values=1, max_values=1)
-
-    async def callback(self, interaction: discord.Interaction):
-        role = interaction.guild.get_role(int(self.values[0]))
-        if not role:
-            return
-        if role in interaction.user.roles:
-            await interaction.user.remove_roles(role)
-            await interaction.response.send_message(f"Removed the role **{role.name}**.", ephemeral=True)
-        else:
-            await interaction.user.add_roles(role)
-            await interaction.response.send_message(f"Assigned you the role **{role.name}**.", ephemeral=True)
-
-
-class RoleView(View):
-    def __init__(self, role_options):
-        super().__init__(timeout=None)
-        self.add_item(RoleSelect(role_options))
+@bot.tree.command(name="check_verification_status", description="Check if a user is verified")
+@app_commands.describe(user="User to check")
+async def check_verification_status(interaction: discord.Interaction, user: discord.Member):
+    if not interaction.user.guild_permissions.moderate_members:
+        await interaction.response.send_message("❌ You need moderation permissions.", ephemeral=True)
+        return
+    
+    row = c.execute("SELECT role_id FROM verification WHERE server_id = ?", (interaction.guild.id,)).fetchone()
+    if not row:
+        await interaction.response.send_message("❌ Verification not set up.", ephemeral=True)
+        return
+    
+    verified_role = interaction.guild.get_role(row["role_id"])
+    is_verified = verified_role in user.roles if verified_role else False
+    
+    embed = discord.Embed(title="Verification Status", color=discord.Color.blue())
+    embed.add_field(name="User", value=user.mention, inline=True)
+    embed.add_field(name="Status", value="✅ Verified" if is_verified else "❌ Not Verified", inline=True)
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # ==================== EVENTS ====================
 
@@ -1179,7 +1351,6 @@ async def on_member_join(member: discord.Member):
             msg = config["welcome_message"].replace("{user}", member.mention).replace("{server}", member.guild.name)
             await channel.send(msg)
     
-    # Save member data for potential restoration
     await save_member_data(member)
 
 
@@ -1254,7 +1425,6 @@ async def on_message(message: discord.Message):
 
 @bot.event
 async def on_guild_join(guild: discord.Guild):
-    """Auto-save server structure when bot joins"""
     save_server_backup(guild)
     await save_all_members(guild)
     log.info(f"Auto-saved backup for {guild.name}")
@@ -1427,7 +1597,6 @@ async def check_unjail():
                     if member:
                         await unjail_member(member)
                 else:
-                    # Guild not found, just remove from DB
                     c.execute("DELETE FROM jailed_members WHERE server_id = ? AND user_id = ?", (server_id, user_id))
                     conn.commit()
         except Exception as e:
@@ -1458,6 +1627,100 @@ async def send_daily_messages():
                 await channel.send(embed=embed)
                 await asyncio.sleep(61)
 
+
+async def get_twitch_oauth_token() -> Optional[str]:
+    if not TWITCH_CLIENT_ID or not TWITCH_CLIENT_SECRET:
+        return None
+    async with aiohttp.ClientSession() as session:
+        async with session.post("https://id.twitch.tv/oauth2/token",
+                                params={"client_id": TWITCH_CLIENT_ID, "client_secret": TWITCH_CLIENT_SECRET,
+                                        "grant_type": "client_credentials"}) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                return data["access_token"]
+    return None
+
+
+async def fetch_twitter_user_id(session: aiohttp.ClientSession, username: str) -> Optional[str]:
+    if username in user_id_cache:
+        return user_id_cache[username]
+    headers = {"Authorization": f"Bearer {TWITTER_BEARER_TOKEN}"}
+    async with session.get(f"https://api.twitter.com/2/users/by/username/{quote(username)}", headers=headers) as resp:
+        if resp.status == 200:
+            data = await resp.json()
+            uid = data.get("data", {}).get("id")
+            if uid:
+                user_id_cache[username] = uid
+                return uid
+    return None
+
+
+async def send_auto_update(bot_instance):
+    auto_update_data = load_json(JSON_FILES["auto_update"], {})
+    for guild_id, data in auto_update_data.items():
+        guild = bot_instance.get_guild(int(guild_id))
+        if not guild:
+            continue
+        channel = bot_instance.get_channel(data.get("channel_id"))
+        if not channel:
+            continue
+        role_mention = f"<@&{data['role_id']}>" if data.get("role_id") else ""
+
+        stock_info = []
+        for file in STOCK_DIR.glob("*.txt"):
+            count = count_stock(file.stem)
+            stock_info.append(f"➜ **{file.stem.capitalize()}**: `{count}` entries")
+            if len(stock_info) >= 20:
+                break
+
+        embed = discord.Embed(title="📦 Stock Update", color=discord.Color.green())
+        embed.add_field(name="Stock", value="\n".join(stock_info) if stock_info else "🚫 No stock available.", inline=False)
+        embed.set_footer(text="Stock updates are live! 🔄")
+
+        try:
+            await channel.send(content=f"📢 {role_mention}, latest stock update!", embed=embed)
+        except:
+            pass
+
+# ==================== VIEW CLASSES ====================
+
+class DeleteStockDropdown(View):
+    def __init__(self, stock_files):
+        super().__init__(timeout=60)
+        options = [discord.SelectOption(label=f[:100], value=f) for f in stock_files[:25]]
+        select = Select(placeholder="Select a stock file to delete", options=options)
+        select.callback = self.select_callback
+        self.add_item(select)
+
+    async def select_callback(self, interaction: discord.Interaction):
+        stock_type = self.children[0].values[0]
+        filename = get_stock_filename(stock_type)
+        if filename.exists():
+            filename.unlink()
+            await interaction.response.send_message(f"✅ The `{stock_type}` stock file has been deleted.", ephemeral=True)
+
+
+class RoleSelect(Select):
+    def __init__(self, role_options):
+        super().__init__(placeholder="Select a role...", options=role_options[:25], min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        role = interaction.guild.get_role(int(self.values[0]))
+        if not role:
+            return
+        if role in interaction.user.roles:
+            await interaction.user.remove_roles(role)
+            await interaction.response.send_message(f"Removed the role **{role.name}**.", ephemeral=True)
+        else:
+            await interaction.user.add_roles(role)
+            await interaction.response.send_message(f"Assigned you the role **{role.name}**.", ephemeral=True)
+
+
+class RoleView(View):
+    def __init__(self, role_options):
+        super().__init__(timeout=None)
+        self.add_item(RoleSelect(role_options))
+
 # ==================== SLASH COMMANDS ====================
 
 # ---------- HELP ----------
@@ -1479,7 +1742,7 @@ async def help_command(interaction: discord.Interaction):
                    value="`/setnotichannel` `/addyoutubechannel` `/addtwitchstream` `/addtwitteraccount`", 
                    inline=False)
     embed.add_field(name="⚙️ Server Management", 
-                   value="`/reactionrole` `/setupverification` `/setverifybutton` `/setreportchannel` `/report` `/setlogchannels` `/save_server` `/load_server` `/pull`", 
+                   value="`/reactionrole` `/setup_oauth_verification` `/send_verify` `/check_verification_status` `/setreportchannel` `/report` `/setlogchannels` `/save_server` `/load_server` `/pull`", 
                    inline=False)
     embed.add_field(name="🎮 Command Control", 
                    value="`/togglecommand` `/commandroles` `/commandchannels` `/listcommands`", 
@@ -1504,7 +1767,6 @@ async def pull_members(interaction: discord.Interaction, target_server: str, cou
     
     await interaction.response.defer(ephemeral=True)
     
-    # Find target guild
     target_guild = None
     for guild in bot.guilds:
         if guild.id == int(target_server) or guild.name.lower() == target_server.lower():
@@ -1515,7 +1777,6 @@ async def pull_members(interaction: discord.Interaction, target_server: str, cou
         await interaction.followup.send(f"❌ Server '{target_server}' not found.", ephemeral=True)
         return
     
-    # Get saved members
     saved_members = c.execute("SELECT DISTINCT user_id FROM saved_members").fetchall()
     
     if count.lower() == "all":
@@ -1588,11 +1849,10 @@ async def list_commands(interaction: discord.Interaction):
                     "gen", "dmgen", "stocklist", "addstock", "deletestock", "setgenaccess", "setautoupdate",
                     "jail", "unjail", "purge", "warnings", "resetwarn", "setroleonjoin", "set_logs", "add_allowed_channel",
                     "upload_bad_words", "sendnotice", "setnotichannel", "addyoutubechannel", "addtwitchstream", "addtwitteraccount",
-                    "reactionrole", "setupverification", "setverifybutton", "setreportchannel", "report", "setlogchannels",
-                    "save_server", "load_server", "add_to_channel", "test", "gif", "meme", "hug", "slap", "say"]
+                    "reactionrole", "setup_oauth_verification", "send_verify", "check_verification_status", "setreportchannel", "report", "setlogchannels",
+                    "save_server", "load_server", "add_to_channel", "test", "gif", "meme", "hug", "slap", "say", "pull"]
     
     embed = discord.Embed(title="📋 Command Settings", color=discord.Color.blue())
-    # Split into multiple fields to avoid 25 field limit
     for i in range(0, len(all_commands), 20):
         chunk = all_commands[i:i+20]
         value = "\n".join([f"`/{cmd}`: {'✅' if is_command_enabled(interaction.guild.id, cmd) else '❌'}" for cmd in chunk])
@@ -1640,7 +1900,6 @@ async def daily(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="coinflip", description="Flip a coin and guess heads or tails")
-@app_commands.describe(guess="heads or tails")
 @app_commands.choices(guess=[
     app_commands.Choice(name="Heads", value="heads"),
     app_commands.Choice(name="Tails", value="tails"),
@@ -1802,7 +2061,7 @@ async def stocklist(interaction: discord.Interaction):
         return
     embed = discord.Embed(title="📦 Available Stock", description="Use `/gen <type>` to generate.", color=discord.Color.blue())
     total = 0
-    files = list(STOCK_DIR.glob("*.txt"))[:20]  # Limit to 20 to avoid field limit
+    files = list(STOCK_DIR.glob("*.txt"))[:20]
     for file in files:
         count = count_stock(file.stem)
         info = STOCK_TYPES.get(file.stem, {"name": file.stem.capitalize(), "emoji": "📄"})
@@ -1845,7 +2104,7 @@ async def deletestock(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
         return
-    files = [f.stem for f in STOCK_DIR.glob("*.txt")][:25]  # Limit to 25
+    files = [f.stem for f in STOCK_DIR.glob("*.txt")][:25]
     if not files:
         await interaction.response.send_message("No stock files available.", ephemeral=True)
         return
@@ -2102,7 +2361,7 @@ async def upload_bad_words(interaction: discord.Interaction, file: discord.Attac
         return
     content = (await file.read()).decode("utf-8", errors="ignore")
     words = [w.strip().lower() for w in content.splitlines() if w.strip()]
-    for word in words[:100]:  # Limit to 100 words
+    for word in words[:100]:
         c.execute("INSERT OR IGNORE INTO bad_words (server_id, word) VALUES (?, ?)", (interaction.guild.id, word))
     conn.commit()
     await interaction.response.send_message(f"✅ Added {len(words)} bad words.")
@@ -2204,40 +2463,6 @@ async def reactionrole(interaction: discord.Interaction, roles: str):
     options = [discord.SelectOption(label=r.name, value=str(r.id)) for r in found]
     embed = discord.Embed(title="🎭 Reaction Role Menu", description="Select a role from the dropdown below.", color=discord.Color.blue())
     await interaction.response.send_message(embed=embed, view=RoleView(options))
-
-
-@bot.tree.command(name="setupverification", description="Set up verification system (Admin only)")
-@app_commands.describe(verify_channel="Channel for verification button", verified_role="Role to give", log_channel="Log channel")
-async def setupverification(interaction: discord.Interaction, verify_channel: discord.TextChannel, 
-                           verified_role: discord.Role, log_channel: discord.TextChannel):
-    if not await check_command_permissions(interaction, "setupverification"):
-        return
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
-        return
-    
-    await setup_verification(interaction.guild, verify_channel, verified_role, log_channel)
-    await interaction.response.send_message("✅ Verification system set up.", ephemeral=True)
-
-
-@bot.tree.command(name="setverifybutton", description="Send verification button (Admin only)")
-async def setverifybutton(interaction: discord.Interaction):
-    if not await check_command_permissions(interaction, "setverifybutton"):
-        return
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
-        return
-    row = c.execute("SELECT channel_id FROM verification WHERE server_id = ?", (interaction.guild.id,)).fetchone()
-    if not row:
-        await interaction.response.send_message("Please run `/setupverification` first.", ephemeral=True)
-        return
-    channel = interaction.guild.get_channel(row[0])
-    if not channel:
-        await interaction.response.send_message("Verification channel not found.", ephemeral=True)
-        return
-    embed = discord.Embed(title="🔒 Verification Required", description="Click the button below to verify.", color=discord.Color.green())
-    await channel.send(embed=embed, view=VerifyButton())
-    await interaction.response.send_message("✅ Verification button sent.", ephemeral=True)
 
 
 @bot.tree.command(name="setreportchannel", description="Set report channel (Admin only)")
@@ -2534,8 +2759,8 @@ async def handle_api_server_config(request):
                     "gen", "dmgen", "stocklist", "addstock", "deletestock", "setgenaccess", "setautoupdate",
                     "jail", "unjail", "purge", "warnings", "resetwarn", "setroleonjoin", "set_logs", "add_allowed_channel",
                     "upload_bad_words", "sendnotice", "setnotichannel", "addyoutubechannel", "addtwitchstream", "addtwitteraccount",
-                    "reactionrole", "setupverification", "setverifybutton", "setreportchannel", "report", "setlogchannels",
-                    "save_server", "load_server", "add_to_channel", "test", "gif", "meme", "hug", "slap", "say"]
+                    "reactionrole", "setup_oauth_verification", "send_verify", "check_verification_status", "setreportchannel", "report", "setlogchannels",
+                    "save_server", "load_server", "add_to_channel", "test", "gif", "meme", "hug", "slap", "say", "pull"]
         for cmd in all_cmds:
             commands_status[cmd] = {
                 "enabled": is_command_enabled(server_id, cmd),
@@ -2576,6 +2801,73 @@ async def handle_api_update_gen_access(request):
         return web.json_response({"error": str(e)}, status=500)
 
 
+async def handle_oauth_callback(request):
+    """Handle OAuth callback from Discord"""
+    code = request.query.get("code")
+    state = request.query.get("state")
+    
+    if not code or not state:
+        return web.Response(text="Missing code or state", status=400)
+    
+    result = await process_oauth_callback(code, state)
+    
+    if result.get("error"):
+        return web.Response(text=f"Verification failed: {result['error']}", status=400)
+    
+    # Auto-add to verified servers
+    await auto_add_to_verified_servers(result["user_id"], result["access_token"])
+    
+    # Return success page
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Verification Successful</title>
+        <style>
+            body {{
+                background: #0a0a0a;
+                color: white;
+                font-family: Arial, sans-serif;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                height: 100vh;
+                margin: 0;
+            }}
+            .container {{
+                text-align: center;
+                background: #111;
+                padding: 40px;
+                border-radius: 16px;
+                border: 1px solid #cc0000;
+            }}
+            h1 {{ color: #cc0000; }}
+            .success {{ color: #00ff00; font-size: 48px; }}
+            .close-btn {{
+                background: #cc0000;
+                color: white;
+                border: none;
+                padding: 10px 20px;
+                border-radius: 8px;
+                cursor: pointer;
+                margin-top: 20px;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="success">✅</div>
+            <h1>Verification Successful!</h1>
+            <p>You have been verified as <strong>{result['username']}</strong>.</p>
+            <p>You can now close this window and return to Discord.</p>
+            <button class="close-btn" onclick="window.close()">Close Window</button>
+        </div>
+    </body>
+    </html>
+    """
+    return web.Response(text=html, content_type="text/html")
+
+
 async def start_api_server():
     app = web.Application()
 
@@ -2602,6 +2894,7 @@ async def start_api_server():
     app.router.add_get("/api/server/{server_id}/config", handle_api_server_config)
     app.router.add_post("/api/server/{server_id}/command/{command}", handle_api_update_command)
     app.router.add_post("/api/server/{server_id}/gen_access", handle_api_update_gen_access)
+    app.router.add_get("/callback", handle_oauth_callback)
 
     port = API_PORT
     for attempt in range(10):
