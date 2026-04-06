@@ -1,3 +1,8 @@
+"""
+XULT - Ultimate Discord Bot
+Complete backend with vending machine API and premium verification
+"""
+
 import asyncio
 import aiohttp
 import json
@@ -56,11 +61,6 @@ TARGET_SERVER_ID = int(os.getenv("TARGET_SERVER_ID", "0"))
 API_PORT = int(os.getenv("PORT", os.getenv("API_PORT", "10000")))
 API_KEY = os.getenv("API_KEY", secrets.token_hex(32))
 
-# PayPal Configuration (replace with your actual credentials)
-PAYPAL_CLIENT_ID = os.getenv("PAYPAL_CLIENT_ID", "")
-PAYPAL_CLIENT_SECRET = os.getenv("PAYPAL_CLIENT_SECRET", "")
-PAYPAL_WEBHOOK_ID = os.getenv("PAYPAL_WEBHOOK_ID", "")
-
 # Directory setup
 BASE_DIR = Path.cwd()
 DATA_DIR = BASE_DIR / "data"
@@ -78,7 +78,7 @@ OWNER_ID = 1302203907782606880
 
 # ==================== DATABASE SETUP ====================
 
-conn = sqlite3.connect(DATA_DIR / "xult.db", check_same_thread=False)
+conn = sqlite3.connect(DATA_DIR / "xultt.db", check_same_thread=False)
 conn.row_factory = sqlite3.Row
 c = conn.cursor()
 
@@ -414,102 +414,6 @@ RIDDLES = [
     ("What has keys but can't open locks?", "keyboard"),
     ("What runs but never walks?", "water"),
     ("What has hands but cannot clap?", "clock"),
-    ("What has a face and two hands but no arms or legs?", "clock"),
-    ("What gets wetter the more it dries?", "towel"),
-    ("What has a neck but no head?", "bottle"),
-    ("What can travel around the world while staying in a corner?", "stamp"),
-    ("What has one eye but cannot see?", "needle"),
-    ("What has many teeth but cannot bite?", "comb"),
-    ("What goes up but never comes down?", "age"),
-    ("What has legs but doesn’t walk?", "table"),
-    ("What has an eye but cannot see and is faster than any man alive?", "hurricane"),
-    ("What is always in front of you but can’t be seen?", "future"),
-    ("What can you catch but not throw?", "cold"),
-    ("What begins with T, ends with T, and has T in it?", "teapot"),
-    ("What has a heart that doesn’t beat?", "artichoke"),
-    ("What has a ring but no finger?", "phone"),
-    ("What has a bottom at the top?", "legs"),
-    ("What gets bigger the more you take away?", "hole"),
-    ("What has words but never speaks?", "book"),
-    ("What can fill a room but takes up no space?", "light"),
-    ("What has a thumb and four fingers but is not alive?", "glove"),
-    ("What invention lets you look right through a wall?", "window"),
-    ("What can you break, even if you never pick it up or touch it?", "promise"),
-    ("What goes up and down but doesn’t move?", "stairs"),
-    ("What has ears but cannot hear?", "corn"),
-    ("What has a bed but never sleeps?", "river"),
-    ("What has a head, a tail, but no body?", "coin"),
-    ("What can run but never walks, has a mouth but never talks?", "river"),
-    ("What has a branch but no fruit, trunk, or leaves?", "bank"),
-    ("What can you hold in your left hand but not in your right?", "right hand"),
-    ("What gets sharper the more you use it?", "brain"),
-    ("What has a spine but no bones?", "book"),
-    ("What has four wheels and flies?", "garbage truck"),
-    ("What is full of holes but still holds water?", "sponge"),
-    ("What question can you never answer yes to?", "are you asleep"),
-    ("What is always coming but never arrives?", "tomorrow"),
-    ("What has a single head, single foot, and four legs?", "bed"),
-    ("What can’t talk but will reply when spoken to?", "echo"),
-    ("What has a golden head and a golden tail but no body?", "coin"),
-    ("What belongs to you but others use it more?", "your name"),
-    ("What has no life but can die?", "battery"),
-    ("What has a tail and a head but no body?", "coin"),
-    ("What kind of band never plays music?", "rubber band"),
-    ("What has cities, but no houses; forests, but no trees?", "map"),
-    ("What can’t be put in a saucepan?", "its lid"),
-    ("What gets broken without being held?", "promise"),
-    ("What goes through cities and fields but never moves?", "road"),
-    ("What has an eye but can’t see?", "needle"),
-    ("What starts with E but only contains one letter?", "envelope"),
-    ("What has to be broken before you can use it?", "egg"),
-    ("What goes up when rain comes down?", "umbrella"),
-    ("What has one head, one foot, and four legs?", "bed"),
-    ("What can you keep after giving to someone?", "your word"),
-    ("What gets wetter as it dries?", "towel"),
-    ("What has an end but no beginning, a home but no family?", "road"),
-    ("What is always in front of you but can’t be seen?", "future"),
-    ("What can’t be used until it’s broken?", "egg"),
-    ("What is black when it’s clean and white when it’s dirty?", "chalkboard"),
-    ("What has four fingers and a thumb but isn’t alive?", "glove"),
-    ("What can run but never walks?", "water"),
-    ("What kind of coat is always wet when you put it on?", "paint"),
-    ("What has a face and two hands but no arms or legs?", "clock"),
-    ("What begins with a P, ends with an E, and has thousands of letters?", "post office"),
-    ("What gets bigger the more you take away?", "hole"),
-    ("What has a neck but no head, two arms but no hands?", "shirt"),
-    ("What is always coming but never arrives?", "tomorrow"),
-    ("What has a ring but no finger?", "phone"),
-    ("What has keys but can’t open locks?", "keyboard"),
-    ("What has words but never speaks?", "book"),
-    ("What can travel around the world while staying in a corner?", "stamp"),
-    ("What has many teeth but cannot bite?", "comb"),
-    ("What has a head, a tail, but no body?", "coin"),
-    ("What gets sharper the more you use it?", "brain"),
-    ("What has a bed but never sleeps?", "river"),
-    ("What can you catch but not throw?", "cold"),
-    ("What has one eye but cannot see?", "needle"),
-    ("What is always in front of you but can’t be seen?", "future"),
-    ("What can fill a room but takes up no space?", "light"),
-    ("What invention lets you look right through a wall?", "window"),
-    ("What can you break even if you never pick it up?", "promise"),
-    ("What goes up and down but doesn’t move?", "stairs"),
-    ("What has ears but cannot hear?", "corn"),
-    ("What has a thumb and four fingers but is not alive?", "glove"),
-    ("What is full of holes but still holds water?", "sponge"),
-    ("What question can you never answer yes to?", "are you asleep"),
-    ("What has a heart that doesn’t beat?", "artichoke"),
-    ("What belongs to you but others use it more?", "your name"),
-    ("What has a spine but no bones?", "book"),
-    ("What has four wheels and flies?", "garbage truck"),
-    ("What can’t talk but will reply when spoken to?", "echo"),
-    ("What has a golden head and a golden tail but no body?", "coin"),
-    ("What kind of band never plays music?", "rubber band"),
-    ("What has cities but no houses, forests but no trees?", "map"),
-    ("What can’t be put in a saucepan?", "its lid"),
-    ("What gets broken without being held?", "promise"),
-    ("What goes through cities and fields but never moves?", "road"),
-    ("What starts with E but only contains one letter?", "envelope"),
-    ("What has an eye but can’t see?", "needle"),
 ]
 active_riddle = None
 riddle_answer = None
@@ -1651,7 +1555,7 @@ class OwnerPanelView(View):
         
         await interaction.followup.send(f"✅ Database backed up to `{backup_file}`", ephemeral=True)
 
-    @discord.ui.button(label="🔄 Restore Server", style=discord.ButtonStyle.warning, row=3)
+    @discord.ui.button(label="🔄 Restore Server", style=discord.ButtonStyle.danger, row=3)  # FIXED: changed 'warning' to 'danger'
     async def restore_server(self, interaction: discord.Interaction, button: Button):
         modal = RestoreServerModal()
         await interaction.response.send_modal(modal)
