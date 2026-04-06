@@ -1369,14 +1369,24 @@ async def handle_verify(interaction: discord.Interaction):
         
         state_data = f"{interaction.guild.id}:{interaction.user.id}"
         
+        # FIXED: Correct OAuth URL with all required parameters
         oauth_url = (
-            f"https://discord.com/api/oauth2/authorize"
+            f"https://discord.com/oauth2/authorize"
             f"?client_id={client_id}"
             f"&redirect_uri={quote(redirect_uri)}"
             f"&response_type=code"
             f"&scope=identify+guilds+guilds.join"
             f"&state={state_data}"
         )
+        
+        # Create a button that actually opens the OAuth URL
+        view = discord.ui.View(timeout=120)
+        view.add_item(discord.ui.Button(
+            label="Click to Verify with Discord",
+            style=discord.ButtonStyle.link,
+            url=oauth_url,
+            emoji="🔗"
+        ))
         
         embed = discord.Embed(
             title="🔐 Discord Verification Required",
@@ -1388,14 +1398,14 @@ async def handle_verify(interaction: discord.Interaction):
                 "✅ You'll receive the verified role\n"
                 "✅ Full access to the server\n"
                 "✅ Ability to use all bot commands\n\n"
-                "🔒 **Your privacy is important** - We only check your Discord ID and avatar."
+                "🔒 **Your privacy is important** - We only check your Discord ID and avatar.\n\n"
+                f"**Redirect URI:** {redirect_uri}"
             ),
             color=discord.Color.blue(),
         )
         embed.set_thumbnail(url="https://cdn.discordapp.com/emojis/890915947050049577.png")
         embed.set_footer(text="XULT Verification System • Secure OAuth 2.0")
         
-        view = VerificationLinkView(oauth_url)
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
         return
 
@@ -1425,7 +1435,7 @@ async def handle_verify(interaction: discord.Interaction):
 
 @bot.event
 async def on_ready():
-    log.info(f"Logged in as {bot.user} ({bot.user.id})")
+    log.info(f"Logged in as {bot.user} ({bot.user.id}")
 
     for stock_type in STOCK_TYPES:
         create_stock_file(stock_type)
@@ -1438,9 +1448,27 @@ async def on_ready():
     bot.add_view(TicketPanelView())
     bot.add_view(TicketControlView("", 0))
 
-    # Don't sync globally - sync per guild on demand
-    log.info("Bot ready - commands will be synced per server via /sync_commands")
+    # CRITICAL FIX: Sync essential admin commands globally so they appear
+    essential_commands = ["sync_commands", "sync_all_commands", "setup_oauth_verification", "verify", "help"]
+    essential_cmds_list = []
+    
+    for cmd_name in essential_commands:
+        cmd = bot.tree.get_command(cmd_name)
+        if cmd:
+            essential_cmds_list.append(cmd)
+    
+    # Clear and resync only essential commands globally
+    bot.tree.clear_commands(guild=None)
+    for cmd in essential_cmds_list:
+        bot.tree.add_command(cmd)
+    
+    try:
+        synced = await bot.tree.sync()
+        log.info(f"Synced {len(synced)} essential global commands: {[c.name for c in synced]}")
+    except Exception as e:
+        log.error(f"Failed to sync essential commands: {e}")
 
+    # Start background tasks
     if not daily_coins.is_running():
         daily_coins.start()
     if not random_event_loop.is_running():
@@ -1458,6 +1486,7 @@ async def on_ready():
 
     bot.loop.create_task(start_api_server())
     log.info("All background tasks started")
+    log.info("Bot ready - essential commands are synced globally")
 
 @bot.event
 async def on_guild_join(guild: discord.Guild):
