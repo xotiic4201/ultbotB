@@ -387,17 +387,14 @@ for file_path in JSON_FILES.values():
     if not file_path.exists():
         file_path.write_text("{}")
 
-
 def load_json(file_path, default=None):
     try:
         return json.loads(file_path.read_text()) or (default if default is not None else {})
     except Exception:
         return default if default is not None else {}
 
-
 def save_json(file_path, data):
     file_path.write_text(json.dumps(data, indent=2))
-
 
 def log_action(user_id: int, action: str, details: str = ""):
     c.execute("INSERT INTO logs (user_id, action, details, timestamp) VALUES (?, ?, ?, ?)",
@@ -411,6 +408,8 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 bot.start_time = datetime.now(timezone.utc)
 bot.owner_id = OWNER_ID
 
+command_sync_cooldown = {}
+
 # ==================== PERMISSION FUNCTIONS ====================
 
 def is_command_enabled(guild_id: int, command_name: str) -> bool:
@@ -418,7 +417,6 @@ def is_command_enabled(guild_id: int, command_name: str) -> bool:
               (guild_id, command_name))
     row = c.fetchone()
     return row[0] == 1 if row else True
-
 
 def get_command_allowed_roles(guild_id: int, command_name: str) -> List[int]:
     c.execute("SELECT allowed_roles FROM command_settings WHERE server_id = ? AND command_name = ?",
@@ -428,7 +426,6 @@ def get_command_allowed_roles(guild_id: int, command_name: str) -> List[int]:
         return json.loads(row[0])
     return []
 
-
 def get_command_disabled_channels(guild_id: int, command_name: str) -> List[int]:
     c.execute("SELECT disabled_channels FROM command_settings WHERE server_id = ? AND command_name = ?",
               (guild_id, command_name))
@@ -436,7 +433,6 @@ def get_command_disabled_channels(guild_id: int, command_name: str) -> List[int]
     if row and row[0]:
         return json.loads(row[0])
     return []
-
 
 def update_command_setting(guild_id: int, command_name: str, enabled: bool,
                            allowed_roles: List[int] = None, disabled_channels: List[int] = None):
@@ -448,6 +444,45 @@ def update_command_setting(guild_id: int, command_name: str, enabled: bool,
                json.dumps(disabled_channels) if disabled_channels else None))
     conn.commit()
 
+# ==================== COMMAND SYNC FUNCTIONS ====================
+
+ALL_COMMANDS = [
+    "help", "balance", "daily", "coinflip", "rps", "slots", "blackjack", 
+    "joke", "eightball", "riddle", "gen", "dmgen", "stocklist", 
+    "jail", "unjail", "purge", "warnings", "resetwarn",
+    "setnotichannel", "addyoutubechannel", "addtwitchstream", "addtwitteraccount",
+    "reactionrole", "setreportchannel", "report", "setup_logging", 
+    "save_server", "load_server", "add_to_channel", "test", 
+    "gif", "meme", "hug", "slap", "say", "ticket_panel", 
+    "close_ticket", "add_ticket_panel", "create_application", 
+    "application_panel", "review_app", "list_applications",
+    "verify", "setup_oauth_verification", "togglecommand", 
+    "commandroles", "commandchannels", "listcommands", "sync_commands",
+    "sync_all_commands", "owner_panel", "owner_stats", "broadcastupdate",
+    "pull", "addstock", "deletestock", "setgenaccess", "setautoupdate",
+    "setroleonjoin", "set_logs", "add_allowed_channel", "upload_bad_words",
+    "sendnotice"
+]
+
+async def resync_guild_commands(guild: discord.Guild):
+    try:
+        enabled_commands = []
+        for cmd_name in ALL_COMMANDS:
+            if is_command_enabled(guild.id, cmd_name):
+                cmd = bot.tree.get_command(cmd_name)
+                if cmd:
+                    enabled_commands.append(cmd)
+        
+        bot.tree.clear_commands(guild=guild)
+        for cmd in enabled_commands:
+            bot.tree.add_command(cmd, guild=guild)
+        
+        await bot.tree.sync(guild=guild)
+        log.info(f"Auto-synced {len(enabled_commands)} commands for guild {guild.id}")
+        return len(enabled_commands)
+    except Exception as e:
+        log.error(f"Failed to auto-sync commands: {e}")
+        return 0
 
 # ==================== LOGGING CONFIGURATION ====================
 
@@ -457,14 +492,12 @@ def get_logging_config(guild_id: int) -> dict:
         return dict(row)
     return {"server_id": guild_id}
 
-
 def update_logging_config(guild_id: int, log_type: str, channel_id: int):
     c.execute(f"""INSERT INTO logging_config (server_id, {log_type})
                  VALUES (?, ?)
                  ON CONFLICT(server_id) DO UPDATE SET {log_type} = ?""",
               (guild_id, channel_id, channel_id))
     conn.commit()
-
 
 async def send_log(guild_id: int, log_type: str, embed: discord.Embed):
     config = get_logging_config(guild_id)
@@ -480,8 +513,7 @@ async def send_log(guild_id: int, log_type: str, embed: discord.Embed):
     try:
         await channel.send(embed=embed)
     except Exception as e:
-        log.error(f"Failed to send log to {channel_id}: {e}")
-
+        log.error(f"Failed to send log: {e}")
 
 # ==================== TICKET SYSTEM ====================
 
@@ -558,7 +590,6 @@ class TicketModal(Modal):
         await interaction.followup.send(f"✅ Ticket created! {channel.mention}", ephemeral=True)
         log_action(interaction.user.id, "CREATE_TICKET", f"ticket={ticket_id} topic={topic}")
 
-
 class TicketPanelView(View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -590,7 +621,6 @@ class TicketPanelView(View):
                           value=f"**Topic:** {ticket['topic']}\n**Status:** {ticket['status'].upper()}\n**Created:** {ticket['created_at'][:10]}",
                           inline=False)
         await interaction.response.send_message(embed=embed, ephemeral=True)
-
 
 class TicketControlView(View):
     def __init__(self, ticket_id: str, channel_id: int):
@@ -637,7 +667,6 @@ class TicketControlView(View):
         if channel:
             await channel.send(f"📌 Ticket claimed by {interaction.user.mention}")
         await interaction.response.send_message("✅ You have claimed this ticket!", ephemeral=True)
-
 
 # ==================== APPLICATION SYSTEM ====================
 
@@ -688,7 +717,6 @@ class ApplicationModal(Modal):
         log_embed.add_field(name="User", value=f"{interaction.user.mention} ({interaction.user.id})", inline=True)
         await send_log(interaction.guild.id, "app_log", log_embed)
 
-
 class ApplicationReviewView(View):
     def __init__(self, app_id: str):
         super().__init__(timeout=None)
@@ -729,7 +757,6 @@ class ApplicationReviewView(View):
         modal = DenyReasonModal(self.app_id)
         await interaction.response.send_modal(modal)
 
-
 class DenyReasonModal(Modal):
     def __init__(self, app_id: str):
         super().__init__(title="Deny Application")
@@ -769,7 +796,6 @@ class DenyReasonModal(Modal):
         log_embed.add_field(name="Reason", value=self.reason_input.value, inline=False)
         await send_log(interaction.guild.id, "app_log", log_embed)
 
-
 class ApplicationPanelView(View):
     def __init__(self, forms: List[Tuple[str, int]]):
         super().__init__(timeout=None)
@@ -793,7 +819,6 @@ class ApplicationPanelView(View):
                 return
             await interaction.response.send_modal(ApplicationModal(form_name, questions))
         return callback
-
 
 # ==================== STOCK TYPE DEFINITIONS ====================
 
@@ -844,12 +869,10 @@ EVENT_CHANNEL_KEYWORDS = [
     "main-chat", "town-square", "gen"
 ]
 
-
 def normalize_channel_name(name: str) -> str:
     name = unicodedata.normalize("NFKD", name)
     name = re.sub(r'[^\w\s-]', '', name)
     return name.lower().strip()
-
 
 def find_main_chat(guild: discord.Guild) -> Optional[discord.TextChannel]:
     for channel in guild.text_channels:
@@ -876,12 +899,10 @@ def find_main_chat(guild: discord.Guild) -> Optional[discord.TextChannel]:
 def get_stock_filename(stock_type: str) -> Path:
     return STOCK_DIR / f"{stock_type.lower().strip().replace(' ', '_')}.txt"
 
-
 def create_stock_file(stock_type: str):
     filename = get_stock_filename(stock_type)
     if not filename.exists():
         filename.write_text("", encoding="utf-8")
-
 
 def count_stock(stock_type: str) -> int:
     filename = get_stock_filename(stock_type)
@@ -896,7 +917,6 @@ def count_stock(stock_type: str) -> int:
     except:
         return 0
 
-
 def read_stock_entries(stock_type: str) -> list:
     filename = get_stock_filename(stock_type)
     create_stock_file(stock_type)
@@ -910,11 +930,9 @@ def read_stock_entries(stock_type: str) -> list:
     except:
         return []
 
-
 def write_stock_entries(stock_type: str, entries: list):
     filename = get_stock_filename(stock_type)
     filename.write_text('\n\n'.join(str(e) for e in entries), encoding="utf-8")
-
 
 def get_stock_entry(stock_type: str) -> Optional[str]:
     entries = read_stock_entries(stock_type)
@@ -924,12 +942,10 @@ def get_stock_entry(stock_type: str) -> Optional[str]:
     write_stock_entries(stock_type, entries[1:])
     return first
 
-
 def add_stock_entries(stock_type: str, new_entries: list):
     current = read_stock_entries(stock_type)
     current.extend(new_entries)
     write_stock_entries(stock_type, current)
-
 
 def is_on_cooldown(user_id: int, is_premium: bool = False) -> Tuple[bool, int]:
     if is_premium:
@@ -939,7 +955,6 @@ def is_on_cooldown(user_id: int, is_premium: bool = False) -> Tuple[bool, int]:
     if elapsed < FREE_GEN_TIMEOUT:
         return True, int(FREE_GEN_TIMEOUT - elapsed)
     return False, 0
-
 
 def set_cooldown(user_id: int):
     user_cooldowns[user_id] = time.time()
@@ -955,30 +970,25 @@ def get_balance(user_id: int) -> int:
     conn.commit()
     return 0
 
-
 def add_coins(user_id: int, amount: int):
     current = get_balance(user_id)
     c.execute("UPDATE users SET coins = ? WHERE id = ?", (current + amount, user_id))
     conn.commit()
-
 
 def remove_coins(user_id: int, amount: int):
     current = get_balance(user_id)
     c.execute("UPDATE users SET coins = ? WHERE id = ?", (max(0, current - amount), user_id))
     conn.commit()
 
-
 def get_xp(user_id: int) -> int:
     c.execute("SELECT xp FROM users WHERE id = ?", (user_id,))
     row = c.fetchone()
     return row[0] if row else 0
 
-
 def get_level(user_id: int) -> int:
     c.execute("SELECT level FROM users WHERE id = ?", (user_id,))
     row = c.fetchone()
     return row[0] if row else 1
-
 
 def add_xp(user_id: int, amount: int) -> bool:
     current_xp = get_xp(user_id)
@@ -1008,7 +1018,6 @@ async def check_user_premium(user_id: int) -> bool:
     if not premium_role:
         return False
     return premium_role in member.roles
-
 
 async def assign_premium_role(user_id: int) -> bool:
     main_guild = bot.get_guild(MAIN_SERVER_ID)
@@ -1048,7 +1057,6 @@ def parse_duration(duration: str) -> timedelta:
         elif unit == 'd': total += timedelta(days=amount)
     return total
 
-
 def contains_bad_word(content: str, guild_id: int) -> bool:
     normalized = re.sub(r'[^a-zA-Z0-9\s]', '', content.lower())
     words = normalized.split()
@@ -1063,7 +1071,6 @@ def contains_bad_word(content: str, guild_id: int) -> bool:
                 return True
     return False
 
-
 def filter_bypass_techniques(content: str) -> bool:
     patterns = [
         r'([a@][s5][s$]?)', r'([n1][i1][g9][g6]?)', r'([s5][e3]?[x8][t7]?)',
@@ -1074,7 +1081,6 @@ def filter_bypass_techniques(content: str) -> bool:
             return True
     return False
 
-
 def get_server_config(guild_id: int) -> dict:
     c.execute("SELECT * FROM server_configs WHERE server_id = ?", (guild_id,))
     row = c.fetchone()
@@ -1082,7 +1088,6 @@ def get_server_config(guild_id: int) -> dict:
         config = json.loads(row["config"]) if row["config"] else {}
         return dict(row, config=config)
     return {"server_id": guild_id, "prefix": "!", "config": {}}
-
 
 async def assign_level_role(member: discord.Member, level: int):
     if level in LEVEL_ROLES:
@@ -1128,7 +1133,6 @@ def save_server_backup(guild: discord.Guild):
                datetime.now(timezone.utc).isoformat(), bot.owner_id))
     conn.commit()
     log.info(f"Backup saved for {guild.name} ({guild.id})")
-
 
 async def load_server_backup(guild: discord.Guild, backup_data: dict = None) -> bool:
     if backup_data is None:
@@ -1186,7 +1190,6 @@ async def load_server_backup(guild: discord.Guild, backup_data: dict = None) -> 
             continue
     return True
 
-
 async def save_member_data(member: discord.Member):
     roles = [r.id for r in member.roles if r.name != "@everyone"]
     c.execute("""INSERT OR REPLACE INTO saved_members
@@ -1195,7 +1198,6 @@ async def save_member_data(member: discord.Member):
               (member.id, str(member), str(member.avatar.url) if member.avatar else None,
                json.dumps(roles), datetime.now(timezone.utc).isoformat(), member.guild.id))
     conn.commit()
-
 
 async def restore_member_to_server(member_id: int, target_guild: discord.Guild) -> bool:
     row = c.execute("SELECT username, avatar, roles FROM saved_members WHERE user_id = ?", (member_id,)).fetchone()
@@ -1208,7 +1210,6 @@ async def restore_member_to_server(member_id: int, target_guild: discord.Guild) 
             await member.add_roles(*roles, reason="Restored from backup")
         return True
     return False
-
 
 async def save_all_members(guild: discord.Guild):
     for member in guild.members:
@@ -1235,7 +1236,6 @@ async def setup_jail_channel(guild: discord.Guild) -> Tuple[discord.TextChannel,
         jail_voice = await guild.create_voice_channel("Jail VC", overwrites=overwrites, reason="Jail system")
     return jail_text, jail_voice
 
-
 async def jail_member(member: discord.Member, duration: str, reason: str, moderator: discord.Member):
     jail_text, jail_voice = await setup_jail_channel(member.guild)
     original_roles = [r for r in member.roles if r.name != "@everyone"]
@@ -1257,7 +1257,6 @@ async def jail_member(member: discord.Member, duration: str, reason: str, modera
     except:
         pass
     return jail_text, jail_voice
-
 
 async def unjail_member(member: discord.Member):
     row = c.execute("SELECT roles FROM jailed_members WHERE server_id = ? AND user_id = ?",
@@ -1298,7 +1297,6 @@ class DeleteStockDropdown(View):
             filename.unlink()
             await interaction.response.send_message(f"✅ The `{stock_type}` stock file has been deleted.", ephemeral=True)
 
-
 class RoleSelect(Select):
     def __init__(self, role_options):
         super().__init__(placeholder="Select a role...", options=role_options[:25], min_values=1, max_values=1)
@@ -1314,14 +1312,17 @@ class RoleSelect(Select):
             await interaction.user.add_roles(role)
             await interaction.response.send_message(f"Assigned you the role **{role.name}**.", ephemeral=True)
 
-
 class RoleView(View):
     def __init__(self, role_options):
         super().__init__(timeout=None)
         self.add_item(RoleSelect(role_options))
 
-
 # ==================== VERIFICATION VIEWS ====================
+
+class VerificationLinkView(View):
+    def __init__(self, oauth_url: str):
+        super().__init__(timeout=120)
+        self.oauth_url = oauth_url
 
 class VerificationView(View):
     def __init__(self, require_oauth: bool = True):
@@ -1335,10 +1336,9 @@ class VerificationView(View):
         emoji="✅",
     )
     async def verify_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await _handle_verify(interaction)
+        await handle_verify(interaction)
 
-
-async def _handle_verify(interaction: discord.Interaction):
+async def handle_verify(interaction: discord.Interaction):
     row = c.execute(
         "SELECT role_id, log_channel_id, require_oauth FROM verification WHERE server_id = ?",
         (interaction.guild.id,),
@@ -1364,23 +1364,39 @@ async def _handle_verify(interaction: discord.Interaction):
         return
 
     if require_oauth:
+        client_id = CLIENT_ID or "1417284780675956766"
+        redirect_uri = REDIRECT_URI or "https://ultbot-f.vercel.app/callback"
+        
+        state_data = f"{interaction.guild.id}:{interaction.user.id}"
+        
         oauth_url = (
             f"https://discord.com/api/oauth2/authorize"
-            f"?client_id={CLIENT_ID}"
-            f"&redirect_uri={quote(REDIRECT_URI)}"
+            f"?client_id={client_id}"
+            f"&redirect_uri={quote(redirect_uri)}"
             f"&response_type=code"
-            f"&scope=identify+guilds"
-            f"&state={interaction.guild.id}:{interaction.user.id}"
+            f"&scope=identify+guilds+guilds.join"
+            f"&state={state_data}"
         )
+        
         embed = discord.Embed(
-            title="🔗 OAuth Verification",
+            title="🔐 Discord Verification Required",
             description=(
-                "Click the link below to verify your account via Discord OAuth.\n\n"
-                f"[**→ Click here to verify**]({oauth_url})"
+                "## **Click the button below to verify your identity**\n\n"
+                "You will be redirected to Discord to authorize your account.\n"
+                "This is a one-time verification to confirm you're a real user.\n\n"
+                "**What happens after verification?**\n"
+                "✅ You'll receive the verified role\n"
+                "✅ Full access to the server\n"
+                "✅ Ability to use all bot commands\n\n"
+                "🔒 **Your privacy is important** - We only check your Discord ID and avatar."
             ),
             color=discord.Color.blue(),
         )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        embed.set_thumbnail(url="https://cdn.discordapp.com/emojis/890915947050049577.png")
+        embed.set_footer(text="XULT Verification System • Secure OAuth 2.0")
+        
+        view = VerificationLinkView(oauth_url)
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
         return
 
     try:
@@ -1414,7 +1430,6 @@ async def on_ready():
     for stock_type in STOCK_TYPES:
         create_stock_file(stock_type)
 
-    # Re-register persistent views
     rows = c.execute("SELECT require_oauth FROM verification").fetchall()
     for row in rows:
         bot.add_view(VerificationView(require_oauth=bool(row["require_oauth"])))
@@ -1423,12 +1438,8 @@ async def on_ready():
     bot.add_view(TicketPanelView())
     bot.add_view(TicketControlView("", 0))
 
-    # Sync commands globally once
-    try:
-        synced = await bot.tree.sync()
-        log.info(f"Synced {len(synced)} global commands")
-    except Exception as e:
-        log.error(f"Failed to sync commands: {e}")
+    # Don't sync globally - sync per guild on demand
+    log.info("Bot ready - commands will be synced per server via /sync_commands")
 
     if not daily_coins.is_running():
         daily_coins.start()
@@ -1448,12 +1459,10 @@ async def on_ready():
     bot.loop.create_task(start_api_server())
     log.info("All background tasks started")
 
-
 @bot.event
 async def on_guild_join(guild: discord.Guild):
     save_server_backup(guild)
     await save_all_members(guild)
-
 
 @bot.event
 async def on_member_join(member: discord.Member):
@@ -1475,7 +1484,6 @@ async def on_member_join(member: discord.Member):
             await channel.send(msg)
     await save_member_data(member)
 
-
 @bot.event
 async def on_member_remove(member: discord.Member):
     config = get_server_config(member.guild.id)
@@ -1484,7 +1492,6 @@ async def on_member_remove(member: discord.Member):
         if channel:
             msg = config["leave_message"].replace("{user}", member.name).replace("{server}", member.guild.name)
             await channel.send(msg)
-
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -1545,7 +1552,6 @@ async def daily_coins():
         add_coins(user_id, 50)
     log.info("Daily coins distributed")
 
-
 @tasks.loop(minutes=60)
 async def random_event_loop():
     if not bot.guilds:
@@ -1563,7 +1569,6 @@ async def random_event_loop():
                              description=f"{member.mention} received **{reward} coins!**",
                              color=discord.Color.gold())
         await channel.send(embed=embed)
-
 
 @tasks.loop(minutes=3)
 async def check_youtube():
@@ -1603,7 +1608,6 @@ async def check_youtube():
             await channel.send(content=role_mention, embed=embed)
         except Exception as e:
             log.error(f"YouTube error: {e}")
-
 
 @tasks.loop(minutes=2)
 async def check_twitch():
@@ -1656,7 +1660,6 @@ async def check_twitch():
             except Exception as e:
                 log.error(f"Twitch error: {e}")
 
-
 @tasks.loop(minutes=5)
 async def check_twitter_posts():
     if not TWITTER_BEARER_TOKEN:
@@ -1700,7 +1703,6 @@ async def check_twitter_posts():
                 log.error(f"Twitter error: {e}")
             await asyncio.sleep(2)
 
-
 @tasks.loop(seconds=30)
 async def check_unjail():
     rows = c.execute("SELECT server_id, user_id, roles, jail_time, duration FROM jailed_members").fetchall()
@@ -1720,7 +1722,6 @@ async def check_unjail():
                     conn.commit()
         except Exception as e:
             log.error(f"Unjail error: {e}")
-
 
 @tasks.loop(minutes=1)
 async def send_daily_messages():
@@ -1745,7 +1746,6 @@ async def send_daily_messages():
                                      color=discord.Color.green())
                 await channel.send(embed=embed)
                 await asyncio.sleep(61)
-
 
 async def send_auto_update(bot_instance):
     auto_update_data = load_json(JSON_FILES["auto_update"], {})
@@ -1801,23 +1801,37 @@ async def setup_oauth_verification(
                1 if require_oauth else 0))
     conn.commit()
 
-    view = VerificationView(require_oauth=require_oauth)
     embed = discord.Embed(
-        title="✅ Verification",
-        description="Click the button below to verify your account.",
-        color=discord.Color.green()
+        title="🔐 Server Verification Required",
+        description=(
+            "## **Welcome to the server!**\n\n"
+            "To prevent bots and ensure a safe community, "
+            "please verify your Discord account.\n\n"
+            "**Why verify?**\n"
+            "• ✅ Access all channels\n"
+            "• ✅ Post messages\n"
+            "• ✅ Use bot commands\n"
+            "• ✅ Join voice chats\n\n"
+            "Click the button below to verify. It only takes a few seconds!"
+        ),
+        color=discord.Color.red(),
+        timestamp=datetime.now(timezone.utc)
     )
+    embed.set_thumbnail(url="https://cdn.discordapp.com/emojis/890915947050049577.png")
+    embed.set_footer(text="XULT Security System • One-time verification required")
+    
+    view = VerificationView(require_oauth=require_oauth)
     msg = await channel.send(embed=embed, view=view)
     bot.add_view(view)
-
+    
     c.execute("UPDATE verification SET message_id = ? WHERE server_id = ?", (msg.id, interaction.guild.id))
     conn.commit()
 
     await interaction.response.send_message(
-        f"✅ Verification panel created in {channel.mention}.", ephemeral=True
+        f"✅ Verification panel created in {channel.mention}. Users can now verify!",
+        ephemeral=True
     )
     log_action(interaction.user.id, "SETUP_VERIFICATION", f"guild={interaction.guild.id}")
-
 
 @bot.tree.command(name="setup_logging", description="Configure all logging channels at once")
 @app_commands.describe(
@@ -1883,7 +1897,6 @@ async def setup_logging(
     else:
         await interaction.response.send_message("❌ No channels specified.", ephemeral=True)
 
-
 # ── TICKET SYSTEM ──────────────────────────────────────────────
 
 @bot.tree.command(name="ticket_panel", description="Create a ticket panel in the current channel")
@@ -1903,7 +1916,6 @@ async def ticket_panel(interaction: discord.Interaction):
     view = TicketPanelView()
     await interaction.response.send_message(embed=embed, view=view)
     log_action(interaction.user.id, "CREATE_TICKET_PANEL", f"guild={interaction.guild.id}")
-
 
 @bot.tree.command(name="close_ticket", description="Close the current ticket")
 async def close_ticket(interaction: discord.Interaction):
@@ -1933,7 +1945,6 @@ async def close_ticket(interaction: discord.Interaction):
     log_embed.add_field(name="Closed By", value=f"{interaction.user.mention} ({interaction.user.id})", inline=True)
     await send_log(interaction.guild.id, "ticket_log", log_embed)
 
-
 @bot.tree.command(name="add_ticket_panel", description="Add ticket panel to a specific channel")
 @app_commands.describe(channel="Channel to add the ticket panel to")
 async def add_ticket_panel(interaction: discord.Interaction, channel: discord.TextChannel):
@@ -1950,7 +1961,6 @@ async def add_ticket_panel(interaction: discord.Interaction, channel: discord.Te
     view = TicketPanelView()
     await channel.send(embed=embed, view=view)
     await interaction.response.send_message(f"✅ Ticket panel added to {channel.mention}", ephemeral=True)
-
 
 # ── APPLICATION SYSTEM ─────────────────────────────────────────
 
@@ -1988,7 +1998,6 @@ async def create_application(
     embed.add_field(name="Questions", value="\n".join([f"{i+1}. {q}" for i, q in enumerate(question_list)]), inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-
 @bot.tree.command(name="application_panel", description="Create an application panel")
 async def application_panel(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
@@ -2004,7 +2013,6 @@ async def application_panel(interaction: discord.Interaction):
         embed.add_field(name=form_name, value=f"{q_count} questions", inline=True)
     view = ApplicationPanelView(forms)
     await interaction.response.send_message(embed=embed, view=view)
-
 
 @bot.tree.command(name="review_app", description="Review an application")
 @app_commands.describe(app_id="Application ID to review")
@@ -2033,7 +2041,6 @@ async def review_app(interaction: discord.Interaction, app_id: str):
     view = ApplicationReviewView(app_id)
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
-
 @bot.tree.command(name="list_applications", description="List all pending applications")
 async def list_applications(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator and not interaction.user.guild_permissions.manage_roles:
@@ -2050,7 +2057,6 @@ async def list_applications(interaction: discord.Interaction):
     embed.set_footer(text="Use /review_app <app_id> to review")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-
 # ── OWNER COMMANDS ────────────────────────────────────────────
 
 @bot.tree.command(name="owner_panel", description="[Owner] Open the bot management panel")
@@ -2063,7 +2069,6 @@ async def owner_panel(interaction: discord.Interaction):
     embed.add_field(name="Latency", value=f"{round(bot.latency*1000,2)}ms", inline=True)
     embed.add_field(name="Uptime", value=str(datetime.now(timezone.utc)-bot.start_time).split('.')[0], inline=True)
     await interaction.response.send_message(embed=embed, ephemeral=True)
-
 
 @bot.tree.command(name="owner_stats", description="[Owner] Get detailed bot statistics")
 async def owner_stats(interaction: discord.Interaction):
@@ -2091,7 +2096,6 @@ async def owner_stats(interaction: discord.Interaction):
     embed.add_field(name="⏰ Uptime", value=str(datetime.now(timezone.utc)-bot.start_time).split('.')[0], inline=True)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-
 @bot.tree.command(name="broadcastupdate", description="[Owner] Broadcast update to all servers")
 @app_commands.describe(message="Update message", thumbnail="Thumbnail image")
 async def broadcastupdate(interaction: discord.Interaction, message: str, thumbnail: discord.Attachment = None):
@@ -2117,7 +2121,6 @@ async def broadcastupdate(interaction: discord.Interaction, message: str, thumbn
                 except:
                     pass
     await interaction.followup.send(f"✅ Broadcasted to {sent} servers.", ephemeral=True)
-
 
 @bot.tree.command(name="pull", description="[Owner] Pull saved members to a server")
 @app_commands.describe(target_server="Target server ID or name", count="Number of members to pull (default: all)")
@@ -2155,7 +2158,6 @@ async def pull_members(interaction: discord.Interaction, target_server: str, cou
     await interaction.followup.send(f"✅ Pulled {success_count}/{len(members_to_pull)} members to **{target_guild.name}**.", ephemeral=True)
     log_action(interaction.user.id, "PULL_MEMBERS", f"target={target_guild.id} count={success_count}")
 
-
 # ── HELP ──────────────────────────────────────────────────────
 
 @bot.tree.command(name="help", description="Get information about the bot and its commands")
@@ -2169,27 +2171,91 @@ async def help_command(interaction: discord.Interaction):
     embed.add_field(name="🔐 Verification", value="`/setup_oauth_verification` `/verify`", inline=False)
     embed.add_field(name="📢 Notifications", value="`/setnotichannel` `/addyoutubechannel` `/addtwitchstream` `/addtwitteraccount`", inline=False)
     embed.add_field(name="⚙️ Server Management", value="`/reactionrole` `/setreportchannel` `/report` `/setup_logging` `/save_server` `/load_server`", inline=False)
-    embed.add_field(name="🎮 Command Control", value="`/togglecommand` `/commandroles` `/commandchannels` `/listcommands`", inline=False)
+    embed.add_field(name="🎮 Command Control", value="`/togglecommand` `/commandroles` `/commandchannels` `/listcommands` `/sync_commands` `/sync_all_commands`", inline=False)
     embed.add_field(name="🌿 4:20 Reminder", value="`/add_to_channel` `/test`", inline=False)
     embed.add_field(name="🎨 Fun", value="`/gif` `/meme` `/hug` `/slap` `/say`", inline=False)
-    embed.set_footer(text="XULT - The Ultimate Discord Bot")
+    embed.set_footer(text="XULT - The Ultimate Discord Bot | Use /sync_commands to hide disabled commands")
     await interaction.response.send_message(embed=embed, ephemeral=True)
-
 
 # ── COMMAND CONTROL ───────────────────────────────────────────
 
-@bot.tree.command(name="togglecommand", description="Enable or disable a command on your server (controls if bot responds, not visibility)")
+@bot.tree.command(name="sync_commands", description="Sync enabled commands to this server (Admin only)")
+@app_commands.default_permissions(administrator=True)
+async def sync_commands(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only.", ephemeral=True)
+        return
+    
+    now = datetime.now()
+    if interaction.guild.id in command_sync_cooldown:
+        if now - command_sync_cooldown[interaction.guild.id] < timedelta(seconds=30):
+            remaining = 30 - (now - command_sync_cooldown[interaction.guild.id]).seconds
+            await interaction.response.send_message(f"⏰ Please wait {remaining} seconds.", ephemeral=True)
+            return
+    
+    await interaction.response.defer(ephemeral=True)
+    command_sync_cooldown[interaction.guild.id] = now
+    
+    enabled_commands = []
+    disabled_commands = []
+    
+    for cmd_name in ALL_COMMANDS:
+        if is_command_enabled(interaction.guild.id, cmd_name):
+            cmd = bot.tree.get_command(cmd_name)
+            if cmd:
+                enabled_commands.append(cmd)
+        else:
+            disabled_commands.append(cmd_name)
+    
+    bot.tree.clear_commands(guild=interaction.guild)
+    for cmd in enabled_commands:
+        bot.tree.add_command(cmd, guild=interaction.guild)
+    
+    await bot.tree.sync(guild=interaction.guild)
+    
+    embed = discord.Embed(title="✅ Commands Synced", color=discord.Color.green())
+    embed.description = f"Synced **{len(enabled_commands)}** enabled commands. Disabled commands are now hidden."
+    if disabled_commands:
+        embed.add_field(name="Hidden Commands", value=f"`{', '.join(disabled_commands[:10])}`", inline=False)
+    
+    await interaction.followup.send(embed=embed)
+
+@bot.tree.command(name="sync_all_commands", description="Sync all commands (Admin only)")
+@app_commands.default_permissions(administrator=True)
+async def sync_all_commands(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only.", ephemeral=True)
+        return
+    
+    await interaction.response.defer(ephemeral=True)
+    
+    bot.tree.clear_commands(guild=interaction.guild)
+    for cmd_name in ALL_COMMANDS:
+        cmd = bot.tree.get_command(cmd_name)
+        if cmd:
+            bot.tree.add_command(cmd, guild=interaction.guild)
+    
+    await bot.tree.sync(guild=interaction.guild)
+    await interaction.followup.send(f"✅ Synced all {len(ALL_COMMANDS)} commands to this server.")
+
+@bot.tree.command(name="togglecommand", description="Enable or disable a command on your server")
 @app_commands.describe(command="Command name", enabled="Enable or disable")
 async def toggle_command(interaction: discord.Interaction, command: str, enabled: bool):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
         return
-    update_command_setting(interaction.guild.id, command.lower(), enabled)
-    await interaction.response.send_message(f"✅ `/{command}` {'enabled' if enabled else 'disabled'} on this server.", ephemeral=True)
-
+    
+    command = command.lower()
+    update_command_setting(interaction.guild.id, command, enabled)
+    
+    await interaction.response.send_message(
+        f"✅ `/{command}` {'enabled' if enabled else 'disabled'}.\n"
+        f"🔄 Run `/sync_commands` to update the slash menu.",
+        ephemeral=True
+    )
 
 @bot.tree.command(name="commandroles", description="Set which roles can use a command")
-@app_commands.describe(command="Command name", roles="Role IDs comma-separated (leave empty to clear restrictions)")
+@app_commands.describe(command="Command name", roles="Role IDs comma-separated")
 async def command_roles(interaction: discord.Interaction, command: str, roles: str = None):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
@@ -2203,9 +2269,8 @@ async def command_roles(interaction: discord.Interaction, command: str, roles: s
         update_command_setting(interaction.guild.id, command, True, role_ids)
         await interaction.response.send_message(f"✅ Only specified roles can use `/{command}`.", ephemeral=True)
 
-
 @bot.tree.command(name="commandchannels", description="Disable a command in specific channels")
-@app_commands.describe(command="Command name", channels="Channel IDs comma-separated (leave empty to clear)")
+@app_commands.describe(command="Command name", channels="Channel IDs comma-separated")
 async def command_channels(interaction: discord.Interaction, command: str, channels: str = None):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
@@ -2219,37 +2284,35 @@ async def command_channels(interaction: discord.Interaction, command: str, chann
         update_command_setting(interaction.guild.id, command, True, None, channel_ids)
         await interaction.response.send_message(f"✅ `/{command}` disabled in those channels.", ephemeral=True)
 
-
 @bot.tree.command(name="listcommands", description="List all commands and their enabled/disabled status")
 async def list_commands(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
         return
-    all_commands = [
-        "help","balance","daily","coinflip","rps","slots","blackjack","joke","eightball","riddle",
-        "gen","dmgen","stocklist","addstock","deletestock","setgenaccess","setautoupdate",
-        "jail","unjail","purge","warnings","resetwarn","setroleonjoin","set_logs","add_allowed_channel",
-        "upload_bad_words","sendnotice","setup_oauth_verification","verify",
-        "setnotichannel","addyoutubechannel","addtwitchstream","addtwitteraccount",
-        "reactionrole","setreportchannel","report","setup_logging","save_server","load_server",
-        "add_to_channel","test","gif","meme","hug","slap","say",
-        "togglecommand","commandroles","commandchannels","listcommands",
-        "ticket_panel","close_ticket","add_ticket_panel",
-        "create_application","application_panel","review_app","list_applications"
-    ]
+    
     embed = discord.Embed(title="📋 Command Settings", color=discord.Color.blue())
-    embed.description = "Note: Commands are still visible in Discord's slash menu — this only controls whether the bot responds to them."
-    chunks = [all_commands[i:i+20] for i in range(0, len(all_commands), 20)]
-    for i, chunk in enumerate(chunks):
-        value = "\n".join([f"`/{cmd}`: {'✅' if is_command_enabled(interaction.guild.id, cmd) else '❌'}" for cmd in chunk])
-        embed.add_field(name=f"Commands {i+1}", value=value, inline=True)
+    enabled_cmds = []
+    disabled_cmds = []
+    
+    for cmd_name in ALL_COMMANDS:
+        if is_command_enabled(interaction.guild.id, cmd_name):
+            enabled_cmds.append(cmd_name)
+        else:
+            disabled_cmds.append(cmd_name)
+    
+    embed.add_field(name=f"✅ Enabled ({len(enabled_cmds)})", value=f"`{', '.join(enabled_cmds[:25])}`", inline=False)
+    embed.add_field(name=f"❌ Disabled ({len(disabled_cmds)})", value=f"`{', '.join(disabled_cmds[:15])}`", inline=False)
+    embed.set_footer(text="Use /sync_commands to update the slash menu")
+    
     await interaction.response.send_message(embed=embed, ephemeral=True)
-
 
 # ── ECONOMY ───────────────────────────────────────────────────
 
 @bot.tree.command(name="balance", description="Check your coins, XP, and level")
 async def balance(interaction: discord.Interaction):
+    if not is_command_enabled(interaction.guild.id, "balance"):
+        await interaction.response.send_message("❌ This command is disabled on this server.", ephemeral=True)
+        return
     coins = get_balance(interaction.user.id)
     xp = get_xp(interaction.user.id)
     level = get_level(interaction.user.id)
@@ -2262,9 +2325,11 @@ async def balance(interaction: discord.Interaction):
     embed.set_thumbnail(url=interaction.user.display_avatar.url)
     await interaction.response.send_message(embed=embed)
 
-
 @bot.tree.command(name="daily", description="Claim your daily coins (24h cooldown)")
 async def daily(interaction: discord.Interaction):
+    if not is_command_enabled(interaction.guild.id, "daily"):
+        await interaction.response.send_message("❌ This command is disabled on this server.", ephemeral=True)
+        return
     c.execute("SELECT last_daily FROM users WHERE id = ?", (interaction.user.id,))
     row = c.fetchone()
     if row and row[0]:
@@ -2281,10 +2346,12 @@ async def daily(interaction: discord.Interaction):
     embed = discord.Embed(title="📅 Daily Reward", description=f"You claimed **{reward} coins**!", color=discord.Color.gold())
     await interaction.response.send_message(embed=embed)
 
-
 @bot.tree.command(name="coinflip", description="Flip a coin and guess heads or tails")
 @app_commands.choices(guess=[app_commands.Choice(name="Heads", value="heads"), app_commands.Choice(name="Tails", value="tails")])
 async def coinflip(interaction: discord.Interaction, guess: app_commands.Choice[str]):
+    if not is_command_enabled(interaction.guild.id, "coinflip"):
+        await interaction.response.send_message("❌ This command is disabled on this server.", ephemeral=True)
+        return
     result = random.choice(["heads", "tails"])
     if guess.value == result:
         add_coins(interaction.user.id, 10)
@@ -2293,10 +2360,12 @@ async def coinflip(interaction: discord.Interaction, guess: app_commands.Choice[
         embed = discord.Embed(title="❌ Wrong!", description=f"Guessed **{guess.name}** but it was **{result}**", color=discord.Color.red())
     await interaction.response.send_message(embed=embed)
 
-
 @bot.tree.command(name="rps", description="Play rock-paper-scissors")
 @app_commands.choices(choice=[app_commands.Choice(name="Rock", value="rock"), app_commands.Choice(name="Paper", value="paper"), app_commands.Choice(name="Scissors", value="scissors")])
 async def rps(interaction: discord.Interaction, choice: app_commands.Choice[str]):
+    if not is_command_enabled(interaction.guild.id, "rps"):
+        await interaction.response.send_message("❌ This command is disabled on this server.", ephemeral=True)
+        return
     bot_choice = random.choice(["rock", "paper", "scissors"])
     wins = {"rock": "scissors", "scissors": "paper", "paper": "rock"}
     if choice.value == bot_choice:
@@ -2308,13 +2377,15 @@ async def rps(interaction: discord.Interaction, choice: app_commands.Choice[str]
         embed = discord.Embed(title="😢 You lose!", description=f"{bot_choice} beats {choice.name}!", color=discord.Color.red())
     await interaction.response.send_message(embed=embed)
 
-
 @bot.tree.command(name="slots", description="Play the slot machine (costs 20 coins)")
 async def slots(interaction: discord.Interaction):
+    if not is_command_enabled(interaction.guild.id, "slots"):
+        await interaction.response.send_message("❌ This command is disabled on this server.", ephemeral=True)
+        return
     if get_balance(interaction.user.id) < 20:
         await interaction.response.send_message("❌ You need 20 coins!", ephemeral=True)
         return
-    add_coins(interaction.user.id, -20)
+    remove_coins(interaction.user.id, 20)
     icons = ["🍒", "🍋", "🔔", "⭐", "💎", "7️⃣"]
     reels = [random.choice(icons) for _ in range(3)]
     if len(set(reels)) == 1:
@@ -2330,10 +2401,12 @@ async def slots(interaction: discord.Interaction):
     embed.set_footer(text=f"Balance: {get_balance(interaction.user.id):,} coins")
     await interaction.response.send_message(embed=embed)
 
-
 @bot.tree.command(name="blackjack", description="Play blackjack against the dealer")
 @app_commands.describe(bet="Amount to bet")
 async def blackjack(interaction: discord.Interaction, bet: int):
+    if not is_command_enabled(interaction.guild.id, "blackjack"):
+        await interaction.response.send_message("❌ This command is disabled on this server.", ephemeral=True)
+        return
     if bet <= 0 or get_balance(interaction.user.id) < bet:
         await interaction.response.send_message("❌ Invalid bet or insufficient coins.", ephemeral=True)
         return
@@ -2353,7 +2426,7 @@ async def blackjack(interaction: discord.Interaction, bet: int):
         dealer.append(deck.pop())
         dv = hand_value(dealer)
     if pv > 21:
-        add_coins(interaction.user.id, -bet)
+        remove_coins(interaction.user.id, bet)
         result = f"❌ Bust! Lost **{bet}** coins."
     elif dv > 21 or pv > dv:
         add_coins(interaction.user.id, bet)
@@ -2361,7 +2434,7 @@ async def blackjack(interaction: discord.Interaction, bet: int):
     elif pv == dv:
         result = "🤝 Push — coins returned."
     else:
-        add_coins(interaction.user.id, -bet)
+        remove_coins(interaction.user.id, bet)
         result = f"😢 Dealer wins. Lost **{bet}** coins."
     embed = discord.Embed(title="🃏 Blackjack", color=discord.Color.green())
     embed.add_field(name="Your hand", value=f"{player} = **{pv}**", inline=True)
@@ -2369,27 +2442,33 @@ async def blackjack(interaction: discord.Interaction, bet: int):
     embed.add_field(name="Result", value=result, inline=False)
     await interaction.response.send_message(embed=embed)
 
-
 @bot.tree.command(name="joke", description="Get a random joke")
 async def joke(interaction: discord.Interaction):
+    if not is_command_enabled(interaction.guild.id, "joke"):
+        await interaction.response.send_message("❌ This command is disabled on this server.", ephemeral=True)
+        return
     async with aiohttp.ClientSession() as session:
         async with session.get("https://official-joke-api.appspot.com/jokes/random") as resp:
             data = await resp.json()
             embed = discord.Embed(description=f"**{data['setup']}**\n\n{data['punchline']}", color=discord.Color.orange())
             await interaction.response.send_message(embed=embed)
 
-
 @bot.tree.command(name="eightball", description="Ask the magic 8-ball a question")
 @app_commands.describe(question="Your question")
 async def eightball(interaction: discord.Interaction, question: str):
+    if not is_command_enabled(interaction.guild.id, "eightball"):
+        await interaction.response.send_message("❌ This command is disabled on this server.", ephemeral=True)
+        return
     responses = ["Yes","No","Maybe","Definitely","Absolutely not","Ask again later","It is certain","Very doubtful"]
     embed = discord.Embed(title=f"🎱 {question[:100]}", description=random.choice(responses), color=discord.Color.dark_blue())
     await interaction.response.send_message(embed=embed)
 
-
 @bot.tree.command(name="riddle", description="Solve a riddle to earn coins")
 async def riddle(interaction: discord.Interaction):
     global active_riddle, riddle_answer
+    if not is_command_enabled(interaction.guild.id, "riddle"):
+        await interaction.response.send_message("❌ This command is disabled on this server.", ephemeral=True)
+        return
     if active_riddle:
         await interaction.response.send_message("A riddle is already active!", ephemeral=True)
         return
@@ -2406,11 +2485,13 @@ async def riddle(interaction: discord.Interaction):
     active_riddle = None
     riddle_answer = None
 
-
 # ── STOCK/GEN ─────────────────────────────────────────────────
 
 @bot.tree.command(name="stocklist", description="List all available stock types")
 async def stocklist(interaction: discord.Interaction):
+    if not is_command_enabled(interaction.guild.id, "stocklist"):
+        await interaction.response.send_message("❌ This command is disabled on this server.", ephemeral=True)
+        return
     embed = discord.Embed(title="📦 Available Stock", description="Use `/gen <type>` to generate.", color=discord.Color.blue())
     total = 0
     for file in list(STOCK_DIR.glob("*.txt"))[:20]:
@@ -2421,10 +2502,12 @@ async def stocklist(interaction: discord.Interaction):
     embed.set_footer(text=f"Total: {total} • Cooldown: 5s for free users")
     await interaction.response.send_message(embed=embed)
 
-
 @bot.tree.command(name="addstock", description="Add stock entries (Admin only)")
 @app_commands.describe(stock_type="Type of stock", file="Text file with entries")
 async def addstock(interaction: discord.Interaction, stock_type: str, file: discord.Attachment = None):
+    if not is_command_enabled(interaction.guild.id, "addstock"):
+        await interaction.response.send_message("❌ This command is disabled on this server.", ephemeral=True)
+        return
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
         return
@@ -2445,9 +2528,11 @@ async def addstock(interaction: discord.Interaction, stock_type: str, file: disc
         await interaction.response.send_message(f"✅ Created {stock_type} stock file.", ephemeral=True)
     log_action(interaction.user.id, "ADD_STOCK", f"type={stock_type}")
 
-
 @bot.tree.command(name="deletestock", description="Delete a stock file (Admin only)")
 async def deletestock(interaction: discord.Interaction):
+    if not is_command_enabled(interaction.guild.id, "deletestock"):
+        await interaction.response.send_message("❌ This command is disabled on this server.", ephemeral=True)
+        return
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
         return
@@ -2458,10 +2543,13 @@ async def deletestock(interaction: discord.Interaction):
     view = DeleteStockDropdown(files)
     await interaction.response.send_message("Select a stock file to delete:", view=view, ephemeral=True)
 
-
 @bot.tree.command(name="gen", description="Generate a stock entry")
 @app_commands.describe(stock_type="Type of stock to generate")
 async def gen(interaction: discord.Interaction, stock_type: str):
+    if not is_command_enabled(interaction.guild.id, "gen"):
+        await interaction.response.send_message("❌ This command is disabled on this server.", ephemeral=True)
+        return
+    
     is_premium = await check_user_premium(interaction.user.id)
     gen_access = load_json(JSON_FILES["gen_access"], {})
     if str(interaction.guild.id) in gen_access:
@@ -2469,6 +2557,7 @@ async def gen(interaction: discord.Interaction, stock_type: str):
         if allowed and not any(r.id in allowed for r in interaction.user.roles):
             await interaction.response.send_message("❌ You don't have permission to use /gen.", ephemeral=True)
             return
+    
     await interaction.response.defer()
     cd, remaining = is_on_cooldown(interaction.user.id, is_premium)
     if cd:
@@ -2493,10 +2582,12 @@ async def gen(interaction: discord.Interaction, stock_type: str):
     conn.commit()
     log_action(interaction.user.id, "GEN", f"type={stock_type}")
 
-
 @bot.tree.command(name="dmgen", description="Generate a stock entry via DM")
 @app_commands.describe(stock_type="Type of stock to generate")
 async def dmgen(interaction: discord.Interaction, stock_type: str):
+    if not is_command_enabled(interaction.guild.id, "dmgen"):
+        await interaction.response.send_message("❌ This command is disabled on this server.", ephemeral=True)
+        return
     if interaction.guild:
         await interaction.response.send_message("❌ This command can only be used in DMs.", ephemeral=True)
         return
@@ -2518,10 +2609,12 @@ async def dmgen(interaction: discord.Interaction, stock_type: str):
               (interaction.user.id, str(interaction.user), stock_type, stock, datetime.now(timezone.utc).isoformat(), 0, "DM", 0, "DM"))
     conn.commit()
 
-
 @bot.tree.command(name="setgenaccess", description="Set roles that can use /gen (Admin only)")
 @app_commands.describe(role="Role to allow")
 async def setgenaccess(interaction: discord.Interaction, role: discord.Role):
+    if not is_command_enabled(interaction.guild.id, "setgenaccess"):
+        await interaction.response.send_message("❌ This command is disabled on this server.", ephemeral=True)
+        return
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
         return
@@ -2534,10 +2627,12 @@ async def setgenaccess(interaction: discord.Interaction, role: discord.Role):
         save_json(JSON_FILES["gen_access"], data)
     await interaction.response.send_message(f"✅ {role.mention} can now use `/gen`.")
 
-
 @bot.tree.command(name="setautoupdate", description="Set auto-update stock channel (Admin only)")
 @app_commands.describe(channel="Channel for updates", role="Role to ping")
 async def setautoupdate(interaction: discord.Interaction, channel: discord.TextChannel, role: discord.Role = None):
+    if not is_command_enabled(interaction.guild.id, "setautoupdate"):
+        await interaction.response.send_message("❌ This command is disabled on this server.", ephemeral=True)
+        return
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
         return
@@ -2546,12 +2641,14 @@ async def setautoupdate(interaction: discord.Interaction, channel: discord.TextC
     save_json(JSON_FILES["auto_update"], data)
     await interaction.response.send_message(f"✅ Auto-update set to {channel.mention}" + (f" with {role.mention}" if role else ""))
 
-
 # ── MODERATION ────────────────────────────────────────────────
 
 @bot.tree.command(name="jail", description="Jail a member")
 @app_commands.describe(member="Member to jail", duration="Duration (e.g., 10m, 2h, 1d)", reason="Reason")
 async def jail_cmd(interaction: discord.Interaction, member: discord.Member, duration: str = "10m", reason: str = "No reason"):
+    if not is_command_enabled(interaction.guild.id, "jail"):
+        await interaction.response.send_message("❌ This command is disabled on this server.", ephemeral=True)
+        return
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
         return
@@ -2563,10 +2660,12 @@ async def jail_cmd(interaction: discord.Interaction, member: discord.Member, dur
     except Exception as e:
         await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
 
-
 @bot.tree.command(name="unjail", description="Unjail a member")
 @app_commands.describe(member="Member to unjail")
 async def unjail_cmd(interaction: discord.Interaction, member: discord.Member):
+    if not is_command_enabled(interaction.guild.id, "unjail"):
+        await interaction.response.send_message("❌ This command is disabled on this server.", ephemeral=True)
+        return
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
         return
@@ -2576,10 +2675,12 @@ async def unjail_cmd(interaction: discord.Interaction, member: discord.Member):
     else:
         await interaction.followup.send(f"{member.mention} is not jailed.")
 
-
 @bot.tree.command(name="purge", description="Delete messages")
 @app_commands.describe(amount="Number of messages (1-100)", channel="Channel to purge")
 async def purge(interaction: discord.Interaction, amount: int = 10, channel: discord.TextChannel = None):
+    if not is_command_enabled(interaction.guild.id, "purge"):
+        await interaction.response.send_message("❌ This command is disabled on this server.", ephemeral=True)
+        return
     if not interaction.user.guild_permissions.manage_messages:
         await interaction.response.send_message("❌ Manage Messages required.", ephemeral=True)
         return
@@ -2591,10 +2692,12 @@ async def purge(interaction: discord.Interaction, amount: int = 10, channel: dis
     deleted = await channel.purge(limit=amount)
     await interaction.followup.send(f"✅ Deleted {len(deleted)} messages.", ephemeral=True)
 
-
 @bot.tree.command(name="warnings", description="View a user's warnings")
 @app_commands.describe(user="User to check")
 async def warnings(interaction: discord.Interaction, user: discord.Member):
+    if not is_command_enabled(interaction.guild.id, "warnings"):
+        await interaction.response.send_message("❌ This command is disabled on this server.", ephemeral=True)
+        return
     rows = c.execute("SELECT reason, timestamp, moderator_id FROM warnings WHERE user_id = ? AND server_id = ? ORDER BY timestamp DESC",
                      (user.id, interaction.guild.id)).fetchall()
     embed = discord.Embed(title=f"⚠️ Warnings for {user.display_name}", color=discord.Color.orange())
@@ -2609,10 +2712,12 @@ async def warnings(interaction: discord.Interaction, user: discord.Member):
                           inline=False)
     await interaction.response.send_message(embed=embed)
 
-
 @bot.tree.command(name="resetwarn", description="Reset a user's warnings (Admin only)")
 @app_commands.describe(user="User to reset", reason="Reason")
 async def resetwarn(interaction: discord.Interaction, user: discord.Member, reason: str = "No reason"):
+    if not is_command_enabled(interaction.guild.id, "resetwarn"):
+        await interaction.response.send_message("❌ This command is disabled on this server.", ephemeral=True)
+        return
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
         return
@@ -2624,10 +2729,12 @@ async def resetwarn(interaction: discord.Interaction, user: discord.Member, reas
         pass
     await interaction.response.send_message(f"✅ Reset warnings for {user.mention}.")
 
-
 @bot.tree.command(name="setroleonjoin", description="Set role for new members (Admin only)")
 @app_commands.describe(role="Role to assign", delay="Delay (e.g., 10m, 2h, 1d)")
 async def setroleonjoin(interaction: discord.Interaction, role: discord.Role, delay: str = "0s"):
+    if not is_command_enabled(interaction.guild.id, "setroleonjoin"):
+        await interaction.response.send_message("❌ This command is disabled on this server.", ephemeral=True)
+        return
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
         return
@@ -2641,10 +2748,12 @@ async def setroleonjoin(interaction: discord.Interaction, role: discord.Role, de
     conn.commit()
     await interaction.response.send_message(f"✅ New members will get {role.mention} after {delay}.")
 
-
 @bot.tree.command(name="set_logs", description="Set log channel (Admin only)")
 @app_commands.describe(channel="Log channel")
 async def set_logs(interaction: discord.Interaction, channel: discord.TextChannel):
+    if not is_command_enabled(interaction.guild.id, "set_logs"):
+        await interaction.response.send_message("❌ This command is disabled on this server.", ephemeral=True)
+        return
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
         return
@@ -2652,10 +2761,12 @@ async def set_logs(interaction: discord.Interaction, channel: discord.TextChanne
     conn.commit()
     await interaction.response.send_message(f"✅ Log channel set to {channel.mention}.")
 
-
 @bot.tree.command(name="add_allowed_channel", description="Allow channel to bypass bad word filter (Admin only)")
 @app_commands.describe(channel="Channel to allow")
 async def add_allowed_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+    if not is_command_enabled(interaction.guild.id, "add_allowed_channel"):
+        await interaction.response.send_message("❌ This command is disabled on this server.", ephemeral=True)
+        return
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
         return
@@ -2663,10 +2774,12 @@ async def add_allowed_channel(interaction: discord.Interaction, channel: discord
     conn.commit()
     await interaction.response.send_message(f"✅ {channel.mention} added to allowed channels.")
 
-
 @bot.tree.command(name="upload_bad_words", description="Upload bad words from .txt file (Admin only)")
 @app_commands.describe(file="Text file with bad words")
 async def upload_bad_words(interaction: discord.Interaction, file: discord.Attachment):
+    if not is_command_enabled(interaction.guild.id, "upload_bad_words"):
+        await interaction.response.send_message("❌ This command is disabled on this server.", ephemeral=True)
+        return
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
         return
@@ -2680,11 +2793,13 @@ async def upload_bad_words(interaction: discord.Interaction, file: discord.Attac
     conn.commit()
     await interaction.response.send_message(f"✅ Added {len(words)} bad words.")
 
-
 @bot.tree.command(name="sendnotice", description="Send a notification")
 @app_commands.describe(message="Message", channel="Channel to send", user="User to DM", title="Embed title", ping_role="Role to ping")
 async def sendnotice(interaction: discord.Interaction, message: str, channel: discord.TextChannel = None,
                      user: discord.User = None, title: str = "Notification", ping_role: discord.Role = None):
+    if not is_command_enabled(interaction.guild.id, "sendnotice"):
+        await interaction.response.send_message("❌ This command is disabled on this server.", ephemeral=True)
+        return
     embed = discord.Embed(title=title, description=message, color=discord.Color.red())
     embed.set_footer(text=f"Sent by {interaction.user.display_name}")
     ping = f"<@&{ping_role.id}> " if ping_role else ""
@@ -2700,12 +2815,14 @@ async def sendnotice(interaction: discord.Interaction, message: str, channel: di
     else:
         await interaction.response.send_message(embed=embed)
 
-
 # ── NOTIFICATIONS ─────────────────────────────────────────────
 
 @bot.tree.command(name="setnotichannel", description="Set channel for media notifications (Admin only)")
 @app_commands.describe(channel="Notification channel", role="Role to ping")
 async def setnotichannel(interaction: discord.Interaction, channel: discord.TextChannel, role: discord.Role = None):
+    if not is_command_enabled(interaction.guild.id, "setnotichannel"):
+        await interaction.response.send_message("❌ This command is disabled on this server.", ephemeral=True)
+        return
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
         return
@@ -2714,10 +2831,12 @@ async def setnotichannel(interaction: discord.Interaction, channel: discord.Text
     save_json(JSON_FILES["server_settings"], data)
     await interaction.response.send_message(f"✅ Notification channel set to {channel.mention}" + (f" with {role.mention}" if role else ""))
 
-
 @bot.tree.command(name="addyoutubechannel", description="Track a YouTube channel (Admin only)")
 @app_commands.describe(channel_id="YouTube channel ID (UCxxxxxx)")
 async def addyoutubechannel(interaction: discord.Interaction, channel_id: str):
+    if not is_command_enabled(interaction.guild.id, "addyoutubechannel"):
+        await interaction.response.send_message("❌ This command is disabled on this server.", ephemeral=True)
+        return
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
         return
@@ -2726,10 +2845,12 @@ async def addyoutubechannel(interaction: discord.Interaction, channel_id: str):
     conn.commit()
     await interaction.response.send_message(f"✅ Tracking YouTube: {channel_id}")
 
-
 @bot.tree.command(name="addtwitchstream", description="Track a Twitch stream (Admin only)")
 @app_commands.describe(channel_name="Twitch username")
 async def addtwitchstream(interaction: discord.Interaction, channel_name: str):
+    if not is_command_enabled(interaction.guild.id, "addtwitchstream"):
+        await interaction.response.send_message("❌ This command is disabled on this server.", ephemeral=True)
+        return
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
         return
@@ -2738,10 +2859,12 @@ async def addtwitchstream(interaction: discord.Interaction, channel_name: str):
     conn.commit()
     await interaction.response.send_message(f"✅ Tracking Twitch: {channel_name}")
 
-
 @bot.tree.command(name="addtwitteraccount", description="Track a Twitter/X account (Admin only)")
 @app_commands.describe(username="Twitter username (without @)")
 async def addtwitteraccount(interaction: discord.Interaction, username: str):
+    if not is_command_enabled(interaction.guild.id, "addtwitteraccount"):
+        await interaction.response.send_message("❌ This command is disabled on this server.", ephemeral=True)
+        return
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
         return
@@ -2750,12 +2873,14 @@ async def addtwitteraccount(interaction: discord.Interaction, username: str):
     conn.commit()
     await interaction.response.send_message(f"✅ Tracking Twitter: @{username}")
 
-
 # ── SERVER MANAGEMENT ─────────────────────────────────────────
 
 @bot.tree.command(name="reactionrole", description="Create a reaction role dropdown (Admin only)")
 @app_commands.describe(roles="Comma-separated role names")
 async def reactionrole(interaction: discord.Interaction, roles: str):
+    if not is_command_enabled(interaction.guild.id, "reactionrole"):
+        await interaction.response.send_message("❌ This command is disabled on this server.", ephemeral=True)
+        return
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
         return
@@ -2768,10 +2893,12 @@ async def reactionrole(interaction: discord.Interaction, roles: str):
     embed = discord.Embed(title="🎭 Reaction Role Menu", description="Select a role from the dropdown below.", color=discord.Color.blue())
     await interaction.response.send_message(embed=embed, view=RoleView(options))
 
-
 @bot.tree.command(name="setreportchannel", description="Set report channel (Admin only)")
 @app_commands.describe(channel="Reports channel", role="Role to ping")
 async def setreportchannel(interaction: discord.Interaction, channel: discord.TextChannel, role: discord.Role):
+    if not is_command_enabled(interaction.guild.id, "setreportchannel"):
+        await interaction.response.send_message("❌ This command is disabled on this server.", ephemeral=True)
+        return
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
         return
@@ -2780,11 +2907,13 @@ async def setreportchannel(interaction: discord.Interaction, channel: discord.Te
     conn.commit()
     await interaction.response.send_message(f"✅ Reports → {channel.mention} | Ping: {role.mention}")
 
-
 @bot.tree.command(name="report", description="Report an issue to moderators")
 @app_commands.describe(issue="What happened", user="User to report", evidence_text="Text evidence", evidence_file="File evidence")
 async def report(interaction: discord.Interaction, issue: str, user: discord.User = None,
                 evidence_text: str = None, evidence_file: discord.Attachment = None):
+    if not is_command_enabled(interaction.guild.id, "report"):
+        await interaction.response.send_message("❌ This command is disabled on this server.", ephemeral=True)
+        return
     row = c.execute("SELECT channel_id, role_id FROM report_channels WHERE server_id = ?", (interaction.guild.id,)).fetchone()
     if not row:
         await interaction.response.send_message("Report channel not set up.", ephemeral=True)
@@ -2805,9 +2934,11 @@ async def report(interaction: discord.Interaction, issue: str, user: discord.Use
     conn.commit()
     await interaction.response.send_message("✅ Report submitted.", ephemeral=True)
 
-
 @bot.tree.command(name="save_server", description="Save server backup (Admin only)")
 async def save_server(interaction: discord.Interaction):
+    if not is_command_enabled(interaction.guild.id, "save_server"):
+        await interaction.response.send_message("❌ This command is disabled on this server.", ephemeral=True)
+        return
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
         return
@@ -2815,9 +2946,11 @@ async def save_server(interaction: discord.Interaction):
     await save_all_members(interaction.guild)
     await interaction.response.send_message("✅ Server backup saved.", ephemeral=True)
 
-
 @bot.tree.command(name="load_server", description="Restore server from backup (Admin only)")
 async def load_server(interaction: discord.Interaction):
+    if not is_command_enabled(interaction.guild.id, "load_server"):
+        await interaction.response.send_message("❌ This command is disabled on this server.", ephemeral=True)
+        return
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
         return
@@ -2828,7 +2961,6 @@ async def load_server(interaction: discord.Interaction):
     ok = await load_server_backup(interaction.guild)
     await interaction.followup.send("✅ Server restore complete." if ok else "❌ Failed to restore.", ephemeral=True)
 
-
 # ── 4:20 ──────────────────────────────────────────────────────
 
 @bot.tree.command(name="add_to_channel", description="Configure 4:20 messages (Admin only)")
@@ -2836,6 +2968,9 @@ async def load_server(interaction: discord.Interaction):
                       role="Role to ping", voice_channel="Voice channel to link")
 async def add_to_channel(interaction: discord.Interaction, daily_channel: discord.TextChannel, timezone: str = "UTC",
                         role: discord.Role = None, voice_channel: discord.VoiceChannel = None):
+    if not is_command_enabled(interaction.guild.id, "add_to_channel"):
+        await interaction.response.send_message("❌ This command is disabled on this server.", ephemeral=True)
+        return
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
         return
@@ -2849,9 +2984,11 @@ async def add_to_channel(interaction: discord.Interaction, daily_channel: discor
     conn.commit()
     await interaction.response.send_message(f"✅ 4:20 set to {daily_channel.mention} (TZ: {tz.zone})" + (f" with {role.mention}" if role else ""))
 
-
 @bot.tree.command(name="test", description="Send a test 4:20 message")
 async def test(interaction: discord.Interaction):
+    if not is_command_enabled(interaction.guild.id, "test"):
+        await interaction.response.send_message("❌ This command is disabled on this server.", ephemeral=True)
+        return
     row = c.execute("SELECT channel_id, role_id, voice_channel_id FROM four_twenty WHERE server_id = ?", (interaction.guild.id,)).fetchone()
     if not row:
         await interaction.response.send_message("No 4:20 configuration found.", ephemeral=True)
@@ -2867,19 +3004,23 @@ async def test(interaction: discord.Interaction):
     await channel.send(embed=embed)
     await interaction.response.send_message("✅ Test message sent!", ephemeral=True)
 
-
 # ── VERIFY ────────────────────────────────────────────────────
 
 @bot.tree.command(name="verify", description="Manually trigger verification")
 async def verify(interaction: discord.Interaction):
-    await _handle_verify(interaction)
-
+    if not is_command_enabled(interaction.guild.id, "verify"):
+        await interaction.response.send_message("❌ This command is disabled on this server.", ephemeral=True)
+        return
+    await handle_verify(interaction)
 
 # ── FUN ───────────────────────────────────────────────────────
 
 @bot.tree.command(name="gif", description="Get a GIF from GIPHY")
 @app_commands.describe(search="Search term")
 async def gif(interaction: discord.Interaction, search: str):
+    if not is_command_enabled(interaction.guild.id, "gif"):
+        await interaction.response.send_message("❌ This command is disabled on this server.", ephemeral=True)
+        return
     async with aiohttp.ClientSession() as session:
         async with session.get(f"https://api.giphy.com/v1/gifs/search?api_key={GIPHY_API_KEY}&q={search}&limit=1&rating=pg") as resp:
             data = await resp.json()
@@ -2890,9 +3031,11 @@ async def gif(interaction: discord.Interaction, search: str):
         embed.description = "No GIF found."
     await interaction.response.send_message(embed=embed)
 
-
 @bot.tree.command(name="meme", description="Get a random meme")
 async def meme(interaction: discord.Interaction):
+    if not is_command_enabled(interaction.guild.id, "meme"):
+        await interaction.response.send_message("❌ This command is disabled on this server.", ephemeral=True)
+        return
     async with aiohttp.ClientSession() as session:
         async with session.get("https://meme-api.com/gimme") as resp:
             data = await resp.json()
@@ -2900,36 +3043,110 @@ async def meme(interaction: discord.Interaction):
             embed.set_image(url=data['url'])
             await interaction.response.send_message(embed=embed)
 
-
 @bot.tree.command(name="hug", description="Hug a member")
 @app_commands.describe(member="Member to hug")
 async def hug(interaction: discord.Interaction, member: discord.Member):
+    if not is_command_enabled(interaction.guild.id, "hug"):
+        await interaction.response.send_message("❌ This command is disabled on this server.", ephemeral=True)
+        return
     embed = discord.Embed(description=f"{interaction.user.mention} hugs {member.mention}! 🤗", color=discord.Color.magenta())
     await interaction.response.send_message(embed=embed)
-
 
 @bot.tree.command(name="slap", description="Slap a member")
 @app_commands.describe(member="Member to slap")
 async def slap(interaction: discord.Interaction, member: discord.Member):
+    if not is_command_enabled(interaction.guild.id, "slap"):
+        await interaction.response.send_message("❌ This command is disabled on this server.", ephemeral=True)
+        return
     embed = discord.Embed(description=f"{interaction.user.mention} slaps {member.mention}! 👋", color=discord.Color.red())
     await interaction.response.send_message(embed=embed)
-
 
 @bot.tree.command(name="say", description="Bot repeats your message")
 @app_commands.describe(text="Text to repeat")
 async def say(interaction: discord.Interaction, text: str):
+    if not is_command_enabled(interaction.guild.id, "say"):
+        await interaction.response.send_message("❌ This command is disabled on this server.", ephemeral=True)
+        return
     await interaction.response.send_message(text[:2000])
 
-
 # ==================== API SERVER ====================
+
+async def handle_oauth_callback(request):
+    try:
+        data = await request.json()
+        code = data.get('code')
+        state = data.get('state')
+        redirect_uri = data.get('redirect_uri')
+        
+        if not code or not state:
+            return web.json_response({"success": False, "error": "Missing parameters"}, status=400)
+        
+        try:
+            guild_id, user_id = state.split(':')
+            guild_id = int(guild_id)
+            user_id = int(user_id)
+        except:
+            return web.json_response({"success": False, "error": "Invalid state format"}, status=400)
+        
+        token_url = "https://discord.com/api/oauth2/token"
+        token_data = {
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": redirect_uri
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(token_url, data=token_data) as resp:
+                if resp.status != 200:
+                    return web.json_response({"success": False, "error": "Token exchange failed"}, status=400)
+                token_json = await resp.json()
+            
+            headers = {"Authorization": f"Bearer {token_json['access_token']}"}
+            async with session.get("https://discord.com/api/users/@me", headers=headers) as resp:
+                if resp.status != 200:
+                    return web.json_response({"success": False, "error": "Failed to get user info"}, status=400)
+                user_data = await resp.json()
+            
+            if int(user_data['id']) != user_id:
+                return web.json_response({"success": False, "error": "User ID mismatch"}, status=400)
+            
+            guild = bot.get_guild(guild_id)
+            if not guild:
+                return web.json_response({"success": False, "error": "Guild not found"}, status=404)
+            
+            row = c.execute("SELECT role_id FROM verification WHERE server_id = ?", (guild_id,)).fetchone()
+            if not row:
+                return web.json_response({"success": False, "error": "Verification not configured"}, status=400)
+            
+            role = guild.get_role(row['role_id'])
+            if not role:
+                return web.json_response({"success": False, "error": "Verified role not found"}, status=404)
+            
+            member = guild.get_member(user_id)
+            if not member:
+                return web.json_response({"success": False, "error": "User not in server"}, status=404)
+            
+            if role not in member.roles:
+                await member.add_roles(role, reason="OAuth Verification")
+            
+            return web.json_response({
+                "success": True,
+                "user_id": str(user_id),
+                "username": user_data['username'],
+                "guild_name": guild.name
+            })
+            
+    except Exception as e:
+        log.error(f"OAuth callback error: {e}")
+        return web.json_response({"success": False, "error": str(e)}, status=500)
 
 async def handle_api_key(request):
     return web.json_response({"key": API_KEY})
 
-
 async def handle_api_health(request):
     return web.json_response({"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()})
-
 
 async def handle_api_stats(request):
     auth = request.headers.get("Authorization", "")
@@ -2965,7 +3182,6 @@ async def handle_api_stats(request):
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
 
-
 async def handle_api_stock(request):
     try:
         stock_data = {}
@@ -2981,7 +3197,6 @@ async def handle_api_stock(request):
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
 
-
 async def handle_api_check_premium(request):
     auth = request.headers.get("Authorization", "")
     if auth != f"Bearer {API_KEY}":
@@ -2994,7 +3209,6 @@ async def handle_api_check_premium(request):
         return web.json_response({"hasPremium": has_premium})
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
-
 
 async def handle_api_gen(request):
     auth = request.headers.get("Authorization", "")
@@ -3030,7 +3244,6 @@ async def handle_api_gen(request):
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
 
-
 async def handle_api_verify_payment(request):
     auth = request.headers.get("Authorization", "")
     if auth != f"Bearer {API_KEY}":
@@ -3052,7 +3265,6 @@ async def handle_api_verify_payment(request):
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
 
-
 async def handle_api_servers(request):
     auth = request.headers.get("Authorization", "")
     if auth != f"Bearer {API_KEY}":
@@ -3064,27 +3276,14 @@ async def handle_api_servers(request):
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
 
-
 async def handle_api_server_config(request):
     auth = request.headers.get("Authorization", "")
     if auth != f"Bearer {API_KEY}":
         return web.json_response({"error": "Unauthorized"}, status=401)
     try:
         server_id = int(request.match_info.get("server_id"))
-        all_cmds = [
-            "help","balance","daily","coinflip","rps","slots","blackjack","joke","eightball","riddle",
-            "gen","dmgen","stocklist","addstock","deletestock","setgenaccess","setautoupdate",
-            "jail","unjail","purge","warnings","resetwarn","setroleonjoin","set_logs","add_allowed_channel",
-            "upload_bad_words","sendnotice","setup_oauth_verification","verify",
-            "setnotichannel","addyoutubechannel","addtwitchstream","addtwitteraccount",
-            "reactionrole","setreportchannel","report","setup_logging","save_server","load_server",
-            "add_to_channel","test","gif","meme","hug","slap","say",
-            "togglecommand","commandroles","commandchannels","listcommands",
-            "ticket_panel","close_ticket","add_ticket_panel",
-            "create_application","application_panel","review_app","list_applications"
-        ]
         commands_status = {}
-        for cmd in all_cmds:
+        for cmd in ALL_COMMANDS:
             commands_status[cmd] = {
                 "enabled": is_command_enabled(server_id, cmd),
                 "allowed_roles": get_command_allowed_roles(server_id, cmd),
@@ -3093,7 +3292,6 @@ async def handle_api_server_config(request):
         return web.json_response({"server_id": server_id, "commands": commands_status})
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
-
 
 async def handle_api_update_command(request):
     auth = request.headers.get("Authorization", "")
@@ -3108,194 +3306,6 @@ async def handle_api_update_command(request):
         return web.json_response({"success": True})
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
-
-
-async def handle_api_update_gen_access(request):
-    auth = request.headers.get("Authorization", "")
-    if auth != f"Bearer {API_KEY}":
-        return web.json_response({"error": "Unauthorized"}, status=401)
-    try:
-        server_id = request.match_info.get("server_id")
-        data = await request.json()
-        gen_access = load_json(JSON_FILES["gen_access"], {})
-        gen_access[server_id] = data.get("roles", [])
-        save_json(JSON_FILES["gen_access"], gen_access)
-        return web.json_response({"success": True})
-    except Exception as e:
-        return web.json_response({"error": str(e)}, status=500)
-
-
-# ── OWNER API ROUTES ──────────────────────────────────────────
-
-async def handle_owner_pull(request):
-    auth = request.headers.get("Authorization", "")
-    if auth != f"Bearer {API_KEY}":
-        return web.json_response({"error": "Unauthorized"}, status=401)
-    try:
-        data = await request.json()
-        target = data.get("target_server", "")
-        count = data.get("count", "all")
-        target_guild = next((g for g in bot.guilds if str(g.id) == target or g.name.lower() == target.lower()), None)
-        if not target_guild:
-            return web.json_response({"error": f"Server '{target}' not found"}, status=404)
-        saved = c.execute("SELECT DISTINCT user_id FROM saved_members").fetchall()
-        members_to_pull = [r[0] for r in saved] if str(count).lower() == "all" else [r[0] for r in saved[:int(count)]]
-        ok = 0
-        for uid in members_to_pull:
-            if await restore_member_to_server(uid, target_guild):
-                ok += 1
-            await asyncio.sleep(0.3)
-        return web.json_response({"success": True, "message": f"Pulled {ok}/{len(members_to_pull)} members to {target_guild.name}"})
-    except Exception as e:
-        return web.json_response({"error": str(e)}, status=500)
-
-
-async def handle_owner_save_all(request):
-    auth = request.headers.get("Authorization", "")
-    if auth != f"Bearer {API_KEY}":
-        return web.json_response({"error": "Unauthorized"}, status=401)
-    try:
-        saved = 0
-        for guild in bot.guilds:
-            save_server_backup(guild)
-            await save_all_members(guild)
-            saved += 1
-            await asyncio.sleep(0.5)
-        return web.json_response({"success": True, "message": f"Saved {saved} servers"})
-    except Exception as e:
-        return web.json_response({"error": str(e)}, status=500)
-
-
-async def handle_owner_manage_coins(request):
-    auth = request.headers.get("Authorization", "")
-    if auth != f"Bearer {API_KEY}":
-        return web.json_response({"error": "Unauthorized"}, status=401)
-    try:
-        data = await request.json()
-        user_id = int(data.get("user_id"))
-        amount = int(data.get("amount", 0))
-        if amount > 0:
-            add_coins(user_id, amount)
-        else:
-            remove_coins(user_id, abs(amount))
-        return web.json_response({"success": True, "message": f"Updated coins for {user_id}"})
-    except Exception as e:
-        return web.json_response({"error": str(e)}, status=500)
-
-
-async def handle_owner_ban_user(request):
-    auth = request.headers.get("Authorization", "")
-    if auth != f"Bearer {API_KEY}":
-        return web.json_response({"error": "Unauthorized"}, status=401)
-    try:
-        data = await request.json()
-        user_id = int(data.get("user_id"))
-        reason = data.get("reason", "No reason")
-        c.execute("UPDATE users SET banned = 1, banned_reason = ? WHERE id = ?", (reason, user_id))
-        conn.commit()
-        return web.json_response({"success": True, "message": f"Banned user {user_id}"})
-    except Exception as e:
-        return web.json_response({"error": str(e)}, status=500)
-
-
-async def handle_owner_premium_users(request):
-    auth = request.headers.get("Authorization", "")
-    if auth != f"Bearer {API_KEY}":
-        return web.json_response({"error": "Unauthorized"}, status=401)
-    try:
-        rows = c.execute("SELECT user_id, granted_at, is_active FROM premium_users ORDER BY granted_at DESC LIMIT 50").fetchall()
-        result = []
-        for row in rows:
-            user = bot.get_user(row["user_id"])
-            result.append({
-                "user_id": str(row["user_id"]),
-                "username": user.name if user else f"User-{row['user_id']}",
-                "granted_at": row["granted_at"],
-                "is_active": row["is_active"],
-            })
-        return web.json_response(result)
-    except Exception as e:
-        return web.json_response({"error": str(e)}, status=500)
-
-
-async def handle_owner_logs(request):
-    auth = request.headers.get("Authorization", "")
-    if auth != f"Bearer {API_KEY}":
-        return web.json_response({"error": "Unauthorized"}, status=401)
-    try:
-        rows = c.execute("SELECT user_id, action, details, timestamp FROM logs ORDER BY timestamp DESC LIMIT 50").fetchall()
-        return web.json_response([
-            {"userId": str(r["user_id"]), "action": r["action"], "details": r["details"], "time": r["timestamp"]}
-            for r in rows
-        ])
-    except Exception as e:
-        return web.json_response({"error": str(e)}, status=500)
-
-
-async def handle_owner_broadcast(request):
-    auth = request.headers.get("Authorization", "")
-    if auth != f"Bearer {API_KEY}":
-        return web.json_response({"error": "Unauthorized"}, status=401)
-    try:
-        data = await request.json()
-        message = data.get("message", "")
-        if not message:
-            return web.json_response({"error": "No message"}, status=400)
-        sent = 0
-        configs = c.execute("SELECT server_id, bot_update_log FROM logging_config WHERE bot_update_log IS NOT NULL").fetchall()
-        for config in configs:
-            guild = bot.get_guild(config["server_id"])
-            if guild:
-                channel = guild.get_channel(config["bot_update_log"])
-                if channel:
-                    embed = discord.Embed(title="📢 XULT Announcement", description=message,
-                                         color=discord.Color.red(), timestamp=datetime.now(timezone.utc))
-                    try:
-                        await channel.send(embed=embed)
-                        sent += 1
-                    except:
-                        pass
-        return web.json_response({"success": True, "message": f"Broadcast sent to {sent} servers"})
-    except Exception as e:
-        return web.json_response({"error": str(e)}, status=500)
-
-
-async def handle_owner_backup_db(request):
-    auth = request.headers.get("Authorization", "")
-    if auth != f"Bearer {API_KEY}":
-        return web.json_response({"error": "Unauthorized"}, status=401)
-    try:
-        filename = f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
-        backup_path = DATA_DIR / filename
-        backup_conn = sqlite3.connect(str(backup_path))
-        conn.backup(backup_conn)
-        backup_conn.close()
-        return web.json_response({"success": True, "filename": filename})
-    except Exception as e:
-        return web.json_response({"error": str(e)}, status=500)
-
-
-async def handle_owner_restore_server(request):
-    auth = request.headers.get("Authorization", "")
-    if auth != f"Bearer {API_KEY}":
-        return web.json_response({"error": "Unauthorized"}, status=401)
-    try:
-        data = await request.json()
-        server_id = int(data.get("server_id"))
-        guild = bot.get_guild(server_id)
-        if not guild:
-            return web.json_response({"error": f"Server {server_id} not found"}, status=404)
-        row = c.execute("SELECT backup_data FROM server_backups WHERE server_id = ? ORDER BY created_at DESC LIMIT 1",
-                       (server_id,)).fetchone()
-        if not row:
-            return web.json_response({"error": "No backup found"}, status=404)
-        success = await load_server_backup(guild, json.loads(row["backup_data"]))
-        if success:
-            return web.json_response({"success": True, "message": f"Restored {guild.name}"})
-        return web.json_response({"error": "Restore failed"}, status=500)
-    except Exception as e:
-        return web.json_response({"error": str(e)}, status=500)
-
 
 # ==================== API SERVER STARTUP ====================
 
@@ -3317,26 +3327,17 @@ async def start_api_server():
 
     app.middlewares.append(cors_middleware)
 
-    app.router.add_get("/health",                                   handle_api_health)
-    app.router.add_get("/api/key",                                  handle_api_key)
-    app.router.add_get("/api/stats",                                handle_api_stats)
-    app.router.add_get("/api/stock",                                handle_api_stock)
-    app.router.add_get("/api/check-premium/{user_id}",              handle_api_check_premium)
-    app.router.add_post("/api/gen",                                 handle_api_gen)
-    app.router.add_post("/api/verify-payment",                      handle_api_verify_payment)
-    app.router.add_get("/api/servers",                              handle_api_servers)
-    app.router.add_get("/api/server/{server_id}/config",            handle_api_server_config)
+    app.router.add_post("/api/verify", handle_oauth_callback)
+    app.router.add_get("/health", handle_api_health)
+    app.router.add_get("/api/key", handle_api_key)
+    app.router.add_get("/api/stats", handle_api_stats)
+    app.router.add_get("/api/stock", handle_api_stock)
+    app.router.add_get("/api/check-premium/{user_id}", handle_api_check_premium)
+    app.router.add_post("/api/gen", handle_api_gen)
+    app.router.add_post("/api/verify-payment", handle_api_verify_payment)
+    app.router.add_get("/api/servers", handle_api_servers)
+    app.router.add_get("/api/server/{server_id}/config", handle_api_server_config)
     app.router.add_post("/api/server/{server_id}/command/{command}", handle_api_update_command)
-    app.router.add_post("/api/server/{server_id}/gen_access",       handle_api_update_gen_access)
-    app.router.add_post("/api/owner/pull",                          handle_owner_pull)
-    app.router.add_post("/api/owner/save_all",                      handle_owner_save_all)
-    app.router.add_post("/api/owner/manage_coins",                  handle_owner_manage_coins)
-    app.router.add_post("/api/owner/ban_user",                      handle_owner_ban_user)
-    app.router.add_get( "/api/owner/premium_users",                 handle_owner_premium_users)
-    app.router.add_get( "/api/owner/logs",                          handle_owner_logs)
-    app.router.add_post("/api/owner/broadcast",                     handle_owner_broadcast)
-    app.router.add_post("/api/owner/backup_db",                     handle_owner_backup_db)
-    app.router.add_post("/api/owner/restore_server",                handle_owner_restore_server)
 
     port = API_PORT
     for attempt in range(10):
@@ -3351,7 +3352,6 @@ async def start_api_server():
             port += 1
     log.error("Could not start API server on any port")
 
-
 # ==================== RUN BOT ====================
 
 if __name__ == "__main__":
@@ -3365,6 +3365,9 @@ if __name__ == "__main__":
     print(f"  Key:    {API_KEY[:8]}...  (stable)")
     print(f"  Premium Role: {PREMIUM_ROLE_ID}")
     print(f"  Main Server:  {MAIN_SERVER_ID}")
+    print("=" * 55)
+    print("  Commands are synced per server via /sync_commands")
+    print("  Disabled commands are hidden from slash menu")
     print("=" * 55)
 
     bot.run(TOKEN)
