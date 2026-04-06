@@ -410,10 +410,6 @@ PREMIUM_GEN_TIMEOUT = 0
 
 LEVEL_ROLES = {5: "Level 5", 10: "Level 10"}
 
-do 3 dude
-
-Alright—here’s the full dump. Buckle up 😄
-
 RIDDLES = [
     ("What has keys but can't open locks?", "keyboard"),
     ("What runs but never walks?", "water"),
