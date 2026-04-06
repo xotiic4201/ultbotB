@@ -350,6 +350,127 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 bot.start_time = datetime.now(timezone.utc)
 bot.owner_id = OWNER_ID
 
+# ==================== DYNAMIC COMMAND TREE ====================
+
+class DynamicCommandTree(app_commands.CommandTree):
+    """Command tree that hides commands based on permissions"""
+    
+    def __init__(self, bot):
+        super().__init__(bot)
+        self._last_interaction = None
+    
+    async def get_commands_for_guild(self, guild_id: int, user_roles: List[int], is_owner: bool = False):
+        """Return only commands visible to this user"""
+        visible_commands = []
+        
+        # Get all commands registered for this guild
+        guild_obj = discord.Object(id=guild_id) if guild_id else None
+        all_commands = await super().get_commands(guild=guild_obj)
+        
+        for cmd in all_commands:
+            # Skip if command is disabled for this guild
+            if not is_command_enabled(guild_id, cmd.name):
+                continue
+            
+            # Skip if user doesn't have required roles
+            allowed_roles = get_command_allowed_roles(guild_id, cmd.name)
+            if allowed_roles and not any(role in allowed_roles for role in user_roles):
+                continue
+            
+            visible_commands.append(cmd)
+        
+        return visible_commands
+    
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        """Check permissions before command execution"""
+        self._last_interaction = interaction
+        
+        if not interaction.guild:
+            return True
+        
+        command_name = interaction.command.name if interaction.command else None
+        if not command_name:
+            return True
+        
+        # Check if command is enabled
+        if not is_command_enabled(interaction.guild.id, command_name):
+            await interaction.response.send_message("❌ This command is disabled on this server.", ephemeral=True)
+            return False
+        
+        # Check role restrictions
+        allowed_roles = get_command_allowed_roles(interaction.guild.id, command_name)
+        if allowed_roles and not any(role.id in allowed_roles for role in interaction.user.roles):
+            await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
+            return False
+        
+        # Check channel restrictions
+        disabled_channels = get_command_disabled_channels(interaction.guild.id, command_name)
+        if interaction.channel.id in disabled_channels:
+            await interaction.response.send_message(f"❌ This command is disabled in {interaction.channel.mention}.", ephemeral=True)
+            return False
+        
+        return True
+
+# ==================== PERMISSION FUNCTIONS ====================
+
+def is_command_enabled(guild_id: int, command_name: str) -> bool:
+    c.execute("SELECT enabled FROM command_settings WHERE server_id = ? AND command_name = ?",
+              (guild_id, command_name))
+    row = c.fetchone()
+    return row[0] == 1 if row else True
+
+
+def get_command_allowed_roles(guild_id: int, command_name: str) -> List[int]:
+    c.execute("SELECT allowed_roles FROM command_settings WHERE server_id = ? AND command_name = ?",
+              (guild_id, command_name))
+    row = c.fetchone()
+    if row and row[0]:
+        return json.loads(row[0])
+    return []
+
+
+def get_command_disabled_channels(guild_id: int, command_name: str) -> List[int]:
+    c.execute("SELECT disabled_channels FROM command_settings WHERE server_id = ? AND command_name = ?",
+              (guild_id, command_name))
+    row = c.fetchone()
+    if row and row[0]:
+        return json.loads(row[0])
+    return []
+
+
+def update_command_setting(guild_id: int, command_name: str, enabled: bool,
+                           allowed_roles: List[int] = None, disabled_channels: List[int] = None):
+    c.execute("""INSERT OR REPLACE INTO command_settings
+                 (server_id, command_name, enabled, allowed_roles, disabled_channels)
+                 VALUES (?, ?, ?, ?, ?)""",
+              (guild_id, command_name.lower(), 1 if enabled else 0,
+               json.dumps(allowed_roles) if allowed_roles else None,
+               json.dumps(disabled_channels) if disabled_channels else None))
+    conn.commit()
+    
+    # Auto-resync commands for this guild
+    asyncio.create_task(sync_guild_commands(guild_id))
+
+
+async def sync_guild_commands(guild_id: int):
+    """Sync commands for a specific guild"""
+    try:
+        guild = bot.get_guild(guild_id)
+        if guild:
+            await bot.tree.sync(guild=discord.Object(id=guild_id))
+            log.info(f"Synced commands for guild {guild.name} ({guild_id})")
+            return True
+    except Exception as e:
+        log.error(f"Failed to sync guild {guild_id}: {e}")
+    return False
+
+
+async def sync_all_guilds():
+    """Sync commands for all guilds"""
+    for guild in bot.guilds:
+        await sync_guild_commands(guild.id)
+        await asyncio.sleep(0.5)
+
 # ==================== STOCK TYPE DEFINITIONS ====================
 
 STOCK_TYPES = {
@@ -644,43 +765,6 @@ async def assign_level_role(member: discord.Member, level: int):
         role = discord.utils.get(member.guild.roles, name=LEVEL_ROLES[level])
         if role:
             await member.add_roles(role)
-
-# ==================== COMMAND PERMISSIONS ====================
-
-def is_command_enabled(guild_id: int, command_name: str) -> bool:
-    c.execute("SELECT enabled FROM command_settings WHERE server_id = ? AND command_name = ?",
-              (guild_id, command_name))
-    row = c.fetchone()
-    return row[0] == 1 if row else True
-
-
-def get_command_allowed_roles(guild_id: int, command_name: str) -> List[int]:
-    c.execute("SELECT allowed_roles FROM command_settings WHERE server_id = ? AND command_name = ?",
-              (guild_id, command_name))
-    row = c.fetchone()
-    if row and row[0]:
-        return json.loads(row[0])
-    return []
-
-
-def get_command_disabled_channels(guild_id: int, command_name: str) -> List[int]:
-    c.execute("SELECT disabled_channels FROM command_settings WHERE server_id = ? AND command_name = ?",
-              (guild_id, command_name))
-    row = c.fetchone()
-    if row and row[0]:
-        return json.loads(row[0])
-    return []
-
-
-def update_command_setting(guild_id: int, command_name: str, enabled: bool,
-                           allowed_roles: List[int] = None, disabled_channels: List[int] = None):
-    c.execute("""INSERT OR REPLACE INTO command_settings
-                 (server_id, command_name, enabled, allowed_roles, disabled_channels)
-                 VALUES (?, ?, ?, ?, ?)""",
-              (guild_id, command_name, 1 if enabled else 0,
-               json.dumps(allowed_roles) if allowed_roles else None,
-               json.dumps(disabled_channels) if disabled_channels else None))
-    conn.commit()
 
 # ==================== ANTI-NUKE / BACKUP ====================
 
@@ -1006,6 +1090,9 @@ async def _handle_verify(interaction: discord.Interaction):
 @bot.event
 async def on_ready():
     log.info(f"Logged in as {bot.user} ({bot.user.id})")
+    
+    # Replace the command tree with dynamic version
+    bot.tree = DynamicCommandTree(bot)
 
     for stock_type in STOCK_TYPES:
         create_stock_file(stock_type)
@@ -1505,6 +1592,58 @@ async def broadcastupdate(interaction: discord.Interaction, message: str, thumbn
     await interaction.followup.send(f"✅ Broadcasted to {sent} servers.", ephemeral=True)
 
 
+@bot.tree.command(name="pull", description="[Owner] Pull saved members to a server")
+@app_commands.describe(target_server="Target server ID or name", count="Number of members to pull (default: all)")
+async def pull_members(interaction: discord.Interaction, target_server: str, count: str = "all"):
+    """Owner-only command to pull saved members to a server"""
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("❌ Owner only.", ephemeral=True)
+        return
+    
+    await interaction.response.defer(ephemeral=True)
+    
+    # Find target guild
+    target_guild = None
+    for guild in bot.guilds:
+        if str(guild.id) == target_server or guild.name.lower() == target_server.lower():
+            target_guild = guild
+            break
+    
+    if not target_guild:
+        await interaction.followup.send(f"❌ Server '{target_server}' not found.", ephemeral=True)
+        return
+    
+    # Get saved members
+    saved = c.execute("SELECT DISTINCT user_id FROM saved_members").fetchall()
+    if not saved:
+        await interaction.followup.send("❌ No saved members found in database.", ephemeral=True)
+        return
+    
+    # Determine how many to pull
+    if str(count).lower() == "all":
+        members_to_pull = [r[0] for r in saved]
+    else:
+        try:
+            limit = int(count)
+            members_to_pull = [r[0] for r in saved[:limit]]
+        except ValueError:
+            await interaction.followup.send("❌ Count must be a number or 'all'.", ephemeral=True)
+            return
+    
+    # Pull members
+    success_count = 0
+    for uid in members_to_pull:
+        if await restore_member_to_server(uid, target_guild):
+            success_count += 1
+        await asyncio.sleep(0.3)  # Rate limiting
+    
+    await interaction.followup.send(
+        f"✅ Pulled {success_count}/{len(members_to_pull)} members to **{target_guild.name}**.",
+        ephemeral=True
+    )
+    log_action(interaction.user.id, "PULL_MEMBERS", f"target={target_guild.id} count={success_count}")
+
+
 # ── HELP ──────────────────────────────────────────────────────
 @bot.tree.command(name="help", description="Get information about the bot and its commands")
 async def help_command(interaction: discord.Interaction):
@@ -1538,10 +1677,6 @@ async def toggle_command(interaction: discord.Interaction, command: str, enabled
         await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
         return
     update_command_setting(interaction.guild.id, command.lower(), enabled)
-    try:
-        await bot.tree.sync(guild=discord.Object(id=interaction.guild.id))
-    except:
-        pass
     await interaction.response.send_message(f"✅ `/{command}` {'enabled' if enabled else 'disabled'}.", ephemeral=True)
 
 
@@ -1605,41 +1740,43 @@ async def view_enabled_commands(interaction: discord.Interaction):
     if not interaction.guild:
         await interaction.response.send_message("This command only works in servers.", ephemeral=True)
         return
-    all_commands = [
-        "help","balance","daily","coinflip","rps","slots","blackjack","joke","eightball","riddle",
-        "gen","dmgen","stocklist","addstock","deletestock","setgenaccess","setautoupdate",
-        "jail","unjail","purge","warnings","resetwarn","setroleonjoin","set_logs","add_allowed_channel",
-        "upload_bad_words","sendnotice","setup_oauth_verification","verify",
-        "setnotichannel","addyoutubechannel","addtwitchstream","addtwitteraccount",
-        "reactionrole","setreportchannel","report","setlogchannels","save_server","load_server",
-        "add_to_channel","test","gif","meme","hug","slap","say",
-        "togglecommand","commandroles","commandchannels","listcommands","view_enabled_commands"
-    ]
-    enabled_list, disabled_list = [], []
-    for cmd_name in all_commands:
-        if is_command_enabled(interaction.guild.id, cmd_name):
-            allowed_roles = get_command_allowed_roles(interaction.guild.id, cmd_name)
-            if allowed_roles and not any(r.id in allowed_roles for r in interaction.user.roles):
-                disabled_list.append(f"❌ /{cmd_name} (role restricted)")
+    
+    user_roles = [role.id for role in interaction.user.roles]
+    enabled_commands = []
+    disabled_commands = []
+    
+    # Get all commands from the tree
+    all_commands = bot.tree.get_commands(guild=discord.Object(id=interaction.guild.id))
+    
+    for cmd in all_commands:
+        if is_command_enabled(interaction.guild.id, cmd.name):
+            allowed_roles = get_command_allowed_roles(interaction.guild.id, cmd.name)
+            if not allowed_roles or any(role in allowed_roles for role in user_roles):
+                enabled_commands.append(f"✅ /{cmd.name}")
             else:
-                enabled_list.append(f"✅ /{cmd_name}")
+                disabled_commands.append(f"🔒 /{cmd.name} (role restricted)")
         else:
-            disabled_list.append(f"❌ /{cmd_name} (disabled)")
+            disabled_commands.append(f"❌ /{cmd.name} (disabled)")
+    
     embed = discord.Embed(title="📋 Your Available Commands", color=discord.Color.blue())
-    if enabled_list:
-        for i, chunk in enumerate([enabled_list[j:j+20] for j in range(0, len(enabled_list), 20)]):
-            embed.add_field(name=f"✅ Enabled {i+1}", value="\n".join(chunk), inline=True)
-    if disabled_list:
-        for i, chunk in enumerate([disabled_list[j:j+20] for j in range(0, len(disabled_list), 20)]):
-            embed.add_field(name=f"❌ Disabled {i+1}", value="\n".join(chunk), inline=True)
+    
+    if enabled_commands:
+        chunks = [enabled_commands[i:i+20] for i in range(0, len(enabled_commands), 20)]
+        for i, chunk in enumerate(chunks):
+            embed.add_field(name=f"✅ Available ({i+1})", value="\n".join(chunk), inline=True)
+    
+    if disabled_commands:
+        chunks = [disabled_commands[i:i+20] for i in range(0, len(disabled_commands), 20)]
+        for i, chunk in enumerate(chunks):
+            embed.add_field(name=f"❌ Unavailable ({i+1})", value="\n".join(chunk), inline=True)
+    
+    embed.set_footer(text=f"Total: {len(enabled_commands)} available • {len(disabled_commands)} unavailable")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # ── ECONOMY ───────────────────────────────────────────────────
 @bot.tree.command(name="balance", description="Check your coins, XP, and level")
 async def balance(interaction: discord.Interaction):
-    if not is_command_enabled(interaction.guild.id, "balance"):
-        await interaction.response.send_message("❌ This command is disabled.", ephemeral=True); return
     coins = get_balance(interaction.user.id)
     xp = get_xp(interaction.user.id)
     level = get_level(interaction.user.id)
@@ -1655,8 +1792,6 @@ async def balance(interaction: discord.Interaction):
 
 @bot.tree.command(name="daily", description="Claim your daily coins (24h cooldown)")
 async def daily(interaction: discord.Interaction):
-    if not is_command_enabled(interaction.guild.id, "daily"):
-        await interaction.response.send_message("❌ This command is disabled.", ephemeral=True); return
     c.execute("SELECT last_daily FROM users WHERE id = ?", (interaction.user.id,))
     row = c.fetchone()
     if row and row[0]:
@@ -1676,8 +1811,6 @@ async def daily(interaction: discord.Interaction):
 @bot.tree.command(name="coinflip", description="Flip a coin and guess heads or tails")
 @app_commands.choices(guess=[app_commands.Choice(name="Heads", value="heads"), app_commands.Choice(name="Tails", value="tails")])
 async def coinflip(interaction: discord.Interaction, guess: app_commands.Choice[str]):
-    if not is_command_enabled(interaction.guild.id, "coinflip"):
-        await interaction.response.send_message("❌ This command is disabled.", ephemeral=True); return
     result = random.choice(["heads", "tails"])
     if guess.value == result:
         add_coins(interaction.user.id, 10)
@@ -1690,8 +1823,6 @@ async def coinflip(interaction: discord.Interaction, guess: app_commands.Choice[
 @bot.tree.command(name="rps", description="Play rock-paper-scissors")
 @app_commands.choices(choice=[app_commands.Choice(name="Rock", value="rock"), app_commands.Choice(name="Paper", value="paper"), app_commands.Choice(name="Scissors", value="scissors")])
 async def rps(interaction: discord.Interaction, choice: app_commands.Choice[str]):
-    if not is_command_enabled(interaction.guild.id, "rps"):
-        await interaction.response.send_message("❌ This command is disabled.", ephemeral=True); return
     bot_choice = random.choice(["rock", "paper", "scissors"])
     wins = {"rock": "scissors", "scissors": "paper", "paper": "rock"}
     if choice.value == bot_choice:
@@ -1706,8 +1837,6 @@ async def rps(interaction: discord.Interaction, choice: app_commands.Choice[str]
 
 @bot.tree.command(name="slots", description="Play the slot machine (costs 20 coins)")
 async def slots(interaction: discord.Interaction):
-    if not is_command_enabled(interaction.guild.id, "slots"):
-        await interaction.response.send_message("❌ This command is disabled.", ephemeral=True); return
     if get_balance(interaction.user.id) < 20:
         await interaction.response.send_message("❌ You need 20 coins!", ephemeral=True); return
     add_coins(interaction.user.id, -20)
@@ -1730,8 +1859,6 @@ async def slots(interaction: discord.Interaction):
 @bot.tree.command(name="blackjack", description="Play blackjack against the dealer")
 @app_commands.describe(bet="Amount to bet")
 async def blackjack(interaction: discord.Interaction, bet: int):
-    if not is_command_enabled(interaction.guild.id, "blackjack"):
-        await interaction.response.send_message("❌ This command is disabled.", ephemeral=True); return
     if bet <= 0 or get_balance(interaction.user.id) < bet:
         await interaction.response.send_message("❌ Invalid bet or insufficient coins.", ephemeral=True); return
     deck = [2,3,4,5,6,7,8,9,10,10,10,10,11] * 4
@@ -1764,8 +1891,6 @@ async def blackjack(interaction: discord.Interaction, bet: int):
 
 @bot.tree.command(name="joke", description="Get a random joke")
 async def joke(interaction: discord.Interaction):
-    if not is_command_enabled(interaction.guild.id, "joke"):
-        await interaction.response.send_message("❌ This command is disabled.", ephemeral=True); return
     async with aiohttp.ClientSession() as session:
         async with session.get("https://official-joke-api.appspot.com/jokes/random") as resp:
             data = await resp.json()
@@ -1776,8 +1901,6 @@ async def joke(interaction: discord.Interaction):
 @bot.tree.command(name="eightball", description="Ask the magic 8-ball a question")
 @app_commands.describe(question="Your question")
 async def eightball(interaction: discord.Interaction, question: str):
-    if not is_command_enabled(interaction.guild.id, "eightball"):
-        await interaction.response.send_message("❌ This command is disabled.", ephemeral=True); return
     responses = ["Yes","No","Maybe","Definitely","Absolutely not","Ask again later","It is certain","Very doubtful"]
     embed = discord.Embed(title=f"🎱 {question[:100]}", description=random.choice(responses), color=discord.Color.dark_blue())
     await interaction.response.send_message(embed=embed)
@@ -1785,8 +1908,6 @@ async def eightball(interaction: discord.Interaction, question: str):
 
 @bot.tree.command(name="riddle", description="Solve a riddle to earn coins")
 async def riddle(interaction: discord.Interaction):
-    if not is_command_enabled(interaction.guild.id, "riddle"):
-        await interaction.response.send_message("❌ This command is disabled.", ephemeral=True); return
     global active_riddle, riddle_answer
     if active_riddle:
         await interaction.response.send_message("A riddle is already active!", ephemeral=True); return
@@ -1806,8 +1927,6 @@ async def riddle(interaction: discord.Interaction):
 # ── STOCK/GEN ─────────────────────────────────────────────────
 @bot.tree.command(name="stocklist", description="List all available stock types")
 async def stocklist(interaction: discord.Interaction):
-    if not is_command_enabled(interaction.guild.id, "stocklist"):
-        await interaction.response.send_message("❌ This command is disabled.", ephemeral=True); return
     embed = discord.Embed(title="📦 Available Stock", description="Use `/gen <type>` to generate.", color=discord.Color.blue())
     total = 0
     for file in list(STOCK_DIR.glob("*.txt"))[:20]:
