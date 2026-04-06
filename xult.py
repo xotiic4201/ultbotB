@@ -34,7 +34,7 @@ TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 if not TOKEN:
     raise ValueError("DISCORD_BOT_TOKEN not set!")
 
-CLIENT_ID = os.getenv("CLIENT_ID", "")
+CLIENT_ID = os.getenv("CLIENT_ID", "1417284780675956766")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET", "")
 REDIRECT_URI = os.getenv("REDIRECT_URI", "https://ultbot-f.vercel.app/callback")
 
