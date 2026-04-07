@@ -1319,11 +1319,6 @@ class RoleView(View):
 
 # ==================== VERIFICATION VIEWS ====================
 
-class VerificationLinkView(View):
-    def __init__(self, oauth_url: str):
-        super().__init__(timeout=120)
-        self.oauth_url = oauth_url
-
 class VerificationView(View):
     def __init__(self, require_oauth: bool = True):
         super().__init__(timeout=None)
@@ -1369,7 +1364,6 @@ async def handle_verify(interaction: discord.Interaction):
         
         state_data = f"{interaction.guild.id}:{interaction.user.id}"
         
-        # FIXED: Correct OAuth URL with all required parameters
         oauth_url = (
             f"https://discord.com/oauth2/authorize"
             f"?client_id={client_id}"
@@ -1379,7 +1373,6 @@ async def handle_verify(interaction: discord.Interaction):
             f"&state={state_data}"
         )
         
-        # Create a button that actually opens the OAuth URL
         view = discord.ui.View(timeout=120)
         view.add_item(discord.ui.Button(
             label="Click to Verify with Discord",
@@ -1435,7 +1428,7 @@ async def handle_verify(interaction: discord.Interaction):
 
 @bot.event
 async def on_ready():
-    log.info(f"Logged in as {bot.user} ({bot.user.id}")
+    log.info(f"Logged in as {bot.user} ({bot.user.id})")
 
     for stock_type in STOCK_TYPES:
         create_stock_file(stock_type)
@@ -1448,25 +1441,10 @@ async def on_ready():
     bot.add_view(TicketPanelView())
     bot.add_view(TicketControlView("", 0))
 
-    # CRITICAL FIX: Sync essential admin commands globally so they appear
-    essential_commands = ["sync_commands", "sync_all_commands", "setup_oauth_verification", "verify", "help"]
-    essential_cmds_list = []
-    
-    for cmd_name in essential_commands:
-        cmd = bot.tree.get_command(cmd_name)
-        if cmd:
-            essential_cmds_list.append(cmd)
-    
-    # Clear and resync only essential commands globally
+    # CRITICAL: Clear ALL global commands to prevent duplication
     bot.tree.clear_commands(guild=None)
-    for cmd in essential_cmds_list:
-        bot.tree.add_command(cmd)
-    
-    try:
-        synced = await bot.tree.sync()
-        log.info(f"Synced {len(synced)} essential global commands: {[c.name for c in synced]}")
-    except Exception as e:
-        log.error(f"Failed to sync essential commands: {e}")
+    await bot.tree.sync()
+    log.info("Cleared all global commands to prevent duplication")
 
     # Start background tasks
     if not daily_coins.is_running():
@@ -1486,7 +1464,7 @@ async def on_ready():
 
     bot.loop.create_task(start_api_server())
     log.info("All background tasks started")
-    log.info("Bot ready - essential commands are synced globally")
+    log.info("Bot ready - Use /sync_commands in each server to sync enabled commands")
 
 @bot.event
 async def on_guild_join(guild: discord.Guild):
@@ -2236,6 +2214,7 @@ async def sync_commands(interaction: discord.Interaction):
         else:
             disabled_commands.append(cmd_name)
     
+    # Clear existing guild commands and add only enabled ones
     bot.tree.clear_commands(guild=interaction.guild)
     for cmd in enabled_commands:
         bot.tree.add_command(cmd, guild=interaction.guild)
