@@ -1399,7 +1399,6 @@ async def gif(interaction: discord.Interaction, search: str):
     await interaction.response.send_message(f"🔍 GIF search for `{search}`\n(API integration would go here)")
 
 @bot.tree.command(name="meme", description="Random meme")
-@bot.tree.command(name="meme", description="Random meme")
 async def meme(interaction: discord.Interaction):
     embed = discord.Embed(title="😂 Random Meme", color=discord.Color.orange())
     embed.set_image(url="https://i.imgflip.com/1bij.jpg")
